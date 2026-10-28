@@ -41,5 +41,6 @@ jobs:
         working-directory: bindings/swift
         run: swift test
       - name: Build tests for iOS
+        # Apple Silicon simulators only; the XCFramework has no x86_64 simulator slice.
         working-directory: bindings/swift
-        run: xcodebuild build-for-testing -scheme SimCoreKit-Package -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO -quiet
+        run: xcodebuild build-for-testing -scheme SimCoreKit-Package -destination 'generic/platform=iOS Simulator' EXCLUDED_ARCHS=x86_64 CODE_SIGNING_ALLOWED=NO -quiet
