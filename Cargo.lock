@@ -647,6 +647,7 @@ version = "0.1.0"
 dependencies = [
  "bevy_ecs",
  "simcore-abi",
+ "simcore-rules",
 ]
 
 [[package]]
@@ -656,6 +657,10 @@ dependencies = [
  "simcore-abi",
  "simcore-engine",
 ]
+
+[[package]]
+name = "simcore-rules"
+version = "0.1.0"
 
 [[package]]
 name = "slab"

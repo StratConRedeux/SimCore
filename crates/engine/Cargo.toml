@@ -7,4 +7,5 @@ version.workspace = true
 
 [dependencies]
 simcore-abi = { path = "../abi" }
+simcore-rules = { path = "../rules" }
 bevy_ecs = { version = "0.20.0", default-features = false, features = ["std"] }
