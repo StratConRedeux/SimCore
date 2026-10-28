@@ -73,7 +73,7 @@ fn header_functions() -> Vec<String> {
 #[test]
 fn exported_symbols_match_header() {
     let expected = header_functions();
-    assert_eq!(expected.len(), 18, "header functions: {expected:?}");
+    assert_eq!(expected.len(), 19, "header functions: {expected:?}");
 
     // --no-llvm-bc: read the Mach-O symbol tables only. Without it Apple's nm also parses the
     // LLVM bitcode Rust embeds in its objects, fails ("Not an int attribute": newer LLVM

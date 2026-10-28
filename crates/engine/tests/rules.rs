@@ -100,6 +100,30 @@ fn pursuer_behind_slower_target_closes_and_engages() {
 }
 
 #[test]
+fn an_event_reports_the_target_where_it_was_relative_to_the_node() {
+    let mut sim = Sim::new(1);
+    sim.set_rules(rules(0.0, 1.0));
+    // The node is off the world origin, so world and frame coordinates differ.
+    sim.set_command_node_position(p(-300.0, 50.0, 0.0));
+    let target = sim.spawn_unit(unit(HOSTILE, p(1000.0, 0.0, 100.0), v(20.0, 0.0, 0.0), 0.0));
+    sim.spawn_pursuer(
+        unit(FRIENDLY, p(0.0, 0.0, 100.0), v(50.0, 0.0, 0.0), 0.0),
+        pursuer(target, 50.0, 1.0, 0.0, 5.0),
+    );
+    let (tick, _) = run_until_engaged(&mut sim, 40 * 15).expect("engages");
+    let e = sim.engagement_events()[0];
+    assert_eq!(
+        (e.target_kind, e.target_affiliation),
+        (kind::GROUND_VEHICLE, HOSTILE)
+    );
+    // The target at the end of the engagement's tick, less the node's position.
+    let x = 1000.0 + 20.0 * tick as f64 / 15.0;
+    // Movement accumulates per tick, so allow for rounding against the closed form.
+    assert!((e.x - to_local_f32(x, -300.0)).abs() < 0.01, "x {}", e.x);
+    assert_eq!((e.y, e.z), (-50.0, 100.0));
+}
+
+#[test]
 fn command_node_is_never_removed() {
     let mut sim = Sim::new(1);
     sim.set_rules(rules(0.0, 1.0));
@@ -115,6 +139,11 @@ fn command_node_is_never_removed() {
     let e = sim.engagement_events()[0];
     assert!(success && e.command_node_hit && !e.target_removed);
     assert_eq!((e.pursuer, e.target), (m, cmd));
+    assert_eq!(
+        (e.target_kind, e.target_affiliation),
+        (kind::COMMAND_NODE, FRIENDLY)
+    );
+    assert_eq!((e.x, e.y, e.z), (0.0, 0.0, 0.0));
     assert_eq!(sim.command_node_hits(), 1);
     assert!(sim.contains(cmd) && !sim.contains(m));
     assert_eq!(sim.unit_count(), 1);

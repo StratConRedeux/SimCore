@@ -146,12 +146,17 @@ from the outcome table for `(outcome_class, target kind)`.
   restore. A hit is skipped if an earlier hit this tick already removed its pursuer or target.
 - Rolls use the Sim's PCG32, seeded from `Sim::new(seed)` on its own stream, so the same seed and
   inputs give the same outcomes.
-- Each resolution is recorded as an
-  `EngagementEvent { tick, pursuer, target, success, target_removed, command_node_hit }`.
-  `success` is the roll; `command_node_hit` is `success` against the command node, and
+- Each resolution is recorded as an `EngagementEvent { tick, pursuer, target, target_kind,
+  target_affiliation, x, y, z, success, target_removed, command_node_hit }`. The target's kind
+  and affiliation are kept because a removed target leaves the frame; `x, y, z` is where it was at
+  the end of the tick, in `f32` metres relative to the command node at that moment (the frame's
+  coordinates). `success` is the roll; `command_node_hit` is `success` against the command node, and
   `target_removed` is `success` against anything else, so at most one of them is set.
   `Sim::engagement_events()` returns the events from the most recent `step` call, in resolution
-  order, from a buffer that is reused.
+  order, from a buffer that is reused. Over the C API (revision 1.4) `sc_world_engagements`
+  returns them as `ScEngagement`s, with the three booleans as `SC_ENGAGEMENT_*` flags. A caller
+  that steps several ticks at once gets every event of that call; a caller that wants only some
+  (a long catch-up) can ignore the rest.
 - `Sim::command_node_hits()` is the running total of command-node hits since `Sim::new`
   (saturating at `u32::MAX`), a field read. The engine attaches no consequence to it: what a hit
   means (damage, a lost game) is for the caller's rules.

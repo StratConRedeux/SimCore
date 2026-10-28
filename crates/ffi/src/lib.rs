@@ -2,7 +2,7 @@
 //!
 //! Every export:
 //! - accepts a NULL handle and returns a safe default (NULL, 0, `UINT32_MAX` for a link delay,
-//!   or an empty [`ScFrame`], [`ScStatus`] or [`ScBytes`]);
+//!   or an empty [`ScFrame`], [`ScEngagements`], [`ScStatus`] or [`ScBytes`]);
 //! - catches unwinding, so no panic crosses the boundary. Release builds use `panic = "abort"`,
 //!   where a panic aborts the process instead; that is also defined behaviour.
 //!
@@ -12,8 +12,9 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub use simcore_abi::{
-    ABI_VERSION, ScBytes, ScCommand, ScFrame, ScLinkRules, ScOutcome, ScRules, ScSensor, ScStatus,
-    ScTerrain, ScUnitSpec, ScUnitView, TICKS_PER_SECOND, command, spawn,
+    ABI_VERSION, ScBytes, ScCommand, ScEngagement, ScEngagements, ScFrame, ScLinkRules, ScOutcome,
+    ScRules, ScSensor, ScStatus, ScTerrain, ScUnitSpec, ScUnitView, TICKS_PER_SECOND, command,
+    engagement, kind, spawn,
 };
 use simcore_engine::{
     EmitterCycle, EmsProfile, LinkRules, Order, OutcomeTable, Position, Pursuer, Rules, Sensor,
@@ -23,6 +24,8 @@ use simcore_engine::{
 /// Opaque world handle (`ScWorld` in the header). C only ever sees a pointer to it.
 pub struct ScWorld {
     sim: Sim,
+    /// The latest step's engagements in C layout, rebuilt by `sc_world_engagements`.
+    engagements: Vec<ScEngagement>,
 }
 
 /// The frame returned on a NULL handle or a failure: null pointer, count 0, tick 0.
@@ -48,7 +51,10 @@ fn guard<R>(default: R, f: impl FnOnce() -> R) -> R {
 }
 
 fn into_handle(sim: Sim) -> *mut ScWorld {
-    Box::into_raw(Box::new(ScWorld { sim }))
+    Box::into_raw(Box::new(ScWorld {
+        sim,
+        engagements: Vec::new(),
+    }))
 }
 
 /// `uint32_t sc_abi_version(void);`
@@ -149,6 +155,62 @@ pub unsafe extern "C" fn sc_world_frame(world: *mut ScWorld) -> ScFrame {
             count,
             _reserved: 0,
             tick,
+        }
+    })
+}
+
+/// The engagements returned on a NULL handle or a failure: null pointer, count 0.
+pub const fn empty_engagements() -> ScEngagements {
+    ScEngagements {
+        events: std::ptr::null(),
+        count: 0,
+        _reserved: 0,
+    }
+}
+
+/// `ScEngagements sc_world_engagements(ScWorld *world);` Returns [`empty_engagements`] on NULL
+/// or failure.
+///
+/// The engagements resolved during the most recent `sc_world_step`, in resolution order. The
+/// returned `events` points into a buffer the handle reuses and stays valid until the next
+/// `sc_world_engagements` or `sc_world_destroy` on this handle.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_engagements(world: *mut ScWorld) -> ScEngagements {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return empty_engagements();
+    };
+    guard(empty_engagements(), || {
+        w.engagements.clear();
+        w.engagements
+            .extend(w.sim.engagement_events().iter().map(|e| ScEngagement {
+                tick: e.tick,
+                pursuer_id: e.pursuer.0,
+                target_id: e.target.0,
+                x: e.x,
+                y: e.y,
+                z: e.z,
+                target_kind: e.target_kind,
+                target_affiliation: e.target_affiliation,
+                flags: (u8::from(e.success) * engagement::SUCCESS)
+                    | (u8::from(e.target_removed) * engagement::TARGET_REMOVED)
+                    | (u8::from(e.command_node_hit) * engagement::COMMAND_NODE_HIT),
+            }));
+        let Ok(count) = u32::try_from(w.engagements.len()) else {
+            return empty_engagements();
+        };
+        ScEngagements {
+            // An empty slice's pointer is dangling; the contract says NULL for "none".
+            events: if count == 0 {
+                std::ptr::null()
+            } else {
+                w.engagements.as_ptr()
+            },
+            count,
+            _reserved: 0,
         }
     })
 }
@@ -602,6 +664,7 @@ const _: () = {
         sc_world_set_terrain;
     let _: unsafe extern "C" fn(*mut ScWorld, *const ScUnitSpec) -> u64 = sc_world_spawn;
     let _: unsafe extern "C" fn(*mut ScWorld, u64, *const ScSensor) -> bool = sc_world_add_sensor;
+    let _: unsafe extern "C" fn(*mut ScWorld) -> ScEngagements = sc_world_engagements;
 };
 
 #[cfg(test)]
@@ -619,6 +682,9 @@ mod tests {
             let f = sc_world_frame(std::ptr::null_mut());
             assert!(f.units.is_null());
             assert_eq!((f.count, f.tick), (0, 0));
+            let e = sc_world_engagements(std::ptr::null_mut());
+            assert!(e.events.is_null());
+            assert_eq!(e.count, 0);
         }
     }
 
@@ -768,6 +834,19 @@ mod tests {
             kind,
             affiliation: aff,
             ..ScUnitSpec::default()
+        }
+    }
+
+    fn engagements_of(w: *mut ScWorld) -> Vec<ScEngagement> {
+        // SAFETY: `w` is a live handle on this thread; the events are copied out before any
+        // other call on it, and only read when there are some (NULL otherwise).
+        unsafe {
+            let e = sc_world_engagements(w);
+            if e.count == 0 {
+                assert!(e.events.is_null());
+                return Vec::new();
+            }
+            std::slice::from_raw_parts(e.events, e.count as usize).to_vec()
         }
     }
 
@@ -1052,7 +1131,6 @@ mod tests {
     #[test]
     fn scenario_built_over_the_c_api_plays_and_survives_save_restore() {
         use simcore_abi::affiliation::{FRIENDLY, HOSTILE};
-        use simcore_engine::kind;
         let w = sc_world_create(42);
         // SAFETY: `w` and `r` are live handles used only on this thread, each destroyed once;
         // pointers point to live locals; snapshot bytes are copied before the next call on `w`.
@@ -1158,13 +1236,33 @@ mod tests {
             };
             let r = sc_world_restore(saved.as_ptr(), saved.len() as u64);
             assert!(!r.is_null());
+            assert!(engagements_of(w).is_empty(), "nothing has engaged yet");
             // 3 km at 100 m/s: about 30 s, 450 ticks. Both worlds play it identically.
+            let mut events = Vec::new();
             for _ in 0..60 {
                 sc_world_step(w, 10);
                 sc_world_step(r, 10);
                 assert_eq!(frame_of(w), frame_of(r));
                 assert_eq!(sc_world_status(w), sc_world_status(r));
+                assert_eq!(engagements_of(w), engagements_of(r));
+                events.extend(engagements_of(w));
             }
+            // The strike's one engagement: a kill, reported where the radar stood.
+            let [e] = events[..] else {
+                panic!("one engagement: {events:?}");
+            };
+            assert_eq!(
+                (
+                    e.pursuer_id,
+                    e.target_id,
+                    e.target_kind,
+                    e.target_affiliation
+                ),
+                (strike, radar, kind::GROUND_RADAR, HOSTILE)
+            );
+            assert_eq!(e.flags, engagement::SUCCESS | engagement::TARGET_REMOVED);
+            assert_eq!((e.x, e.y, e.z), (3_000.0, 0.0, 0.0));
+            assert!((400..=500).contains(&e.tick), "engaged at tick {}", e.tick);
             let s = sc_world_status(w);
             assert_eq!(
                 s.unit_count, 2,

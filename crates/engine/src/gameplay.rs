@@ -8,7 +8,7 @@ use bevy_ecs::prelude::*;
 use simcore_abi::affiliation;
 use simcore_rules::{
     Kinematic, PursuitParams, Vec3, closest_approach, detection_range, in_detection_range,
-    pursuit_velocity, signal_strength_sq,
+    pursuit_velocity, signal_strength_sq, to_local_f32,
 };
 
 use crate::grid::SpatialGrid;
@@ -461,12 +461,20 @@ fn kinematic(p: &Position, v: &Velocity) -> Kinematic {
 }
 
 /// One resolved engagement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngagementEvent {
     /// [`crate::Sim::tick`] once the engagement's tick completed.
     pub tick: u64,
     pub pursuer: StableId,
     pub target: StableId,
+    /// The target's kind and affiliation, which outlive a removed target.
+    pub target_kind: u16,
+    pub target_affiliation: u8,
+    /// Where the target was at the end of the tick, in f32 metres relative to the command node
+    /// at that moment (the frame's coordinates).
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
     /// The roll succeeded. The pursuer is removed either way.
     pub success: bool,
     /// The target was removed: a success against anything but the command node, which is
@@ -483,6 +491,9 @@ pub(crate) struct Hit {
     pursuer: StableId,
     target_entity: Entity,
     target: StableId,
+    target_kind: u16,
+    target_affiliation: u8,
+    target_position: Position,
     chance: f64,
 }
 
@@ -494,7 +505,12 @@ type PursuerQuery = (
     &'static Velocity,
     &'static Gone,
 );
-type TargetQuery = (&'static Position, &'static Velocity, &'static UnitKind);
+type TargetQuery = (
+    &'static Position,
+    &'static Velocity,
+    &'static UnitKind,
+    &'static Affiliation,
+);
 
 /// Cached queries, buffers and the seeded PRNG for engagement resolution.
 pub(crate) struct Engagements {
@@ -571,7 +587,10 @@ impl Engagements {
     ///
     /// Removal takes the unit out of the id index and marks it [`Gone`]; the entity itself is
     /// despawned later, outside `step`, so resolution does not allocate.
-    pub fn resolve(&mut self, world: &mut World, tick: u64) {
+    ///
+    /// `origin` is the command node's position after this tick's movement: events report
+    /// positions relative to it.
+    pub fn resolve(&mut self, world: &mut World, tick: u64, origin: Position) {
         self.hits.clear();
         {
             let world: &World = world;
@@ -584,7 +603,7 @@ impl Engagements {
                 let Some(te) = index.get(p.target).filter(|&t| t != e) else {
                     continue;
                 };
-                let Ok((tp, tv, kind)) = self.targets.get(world, te) else {
+                let Ok((tp, tv, kind, aff)) = self.targets.get(world, te) else {
                     continue;
                 };
                 // Positions are post-movement: sweep back over the tick just simulated.
@@ -602,6 +621,9 @@ impl Engagements {
                         pursuer: *id,
                         target_entity: te,
                         target: p.target,
+                        target_kind: kind.0,
+                        target_affiliation: aff.0,
+                        target_position: *tp,
                         chance: rules.outcomes.chance(p.outcome_class, kind.0),
                     });
                 }
@@ -632,6 +654,11 @@ impl Engagements {
                 tick,
                 pursuer: h.pursuer,
                 target: h.target,
+                target_kind: h.target_kind,
+                target_affiliation: h.target_affiliation,
+                x: to_local_f32(h.target_position.x, origin.x),
+                y: to_local_f32(h.target_position.y, origin.y),
+                z: to_local_f32(h.target_position.z, origin.z),
                 success,
                 target_removed,
                 command_node_hit,

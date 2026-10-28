@@ -229,3 +229,45 @@ private enum Environment {
         #expect(restored.linkDelay(unit: 1) == 3, "setup is saved with the world")
     }
 }
+
+@Suite struct ContractRevision14Tests {
+    @Test func engagementLayoutMatchesHeader() {
+        #expect(MemoryLayout<ScEngagement>.size == 40)
+        #expect(MemoryLayout<ScEngagement>.offset(of: \.target_kind) == 36)
+        #expect(MemoryLayout<ScEngagement>.offset(of: \.flags) == 39)
+        #expect(MemoryLayout<ScEngagements>.size == 16)
+    }
+
+    @Test func aStrikeReportsItsKill() throws {
+        let world = try #require(SimWorld(seed: 3))
+        var rules = ScRules()
+        rules.default_chance = 1
+        #expect(world.setRules(rules))
+        var radar = ScUnitSpec()
+        (radar.x, radar.y, radar.kind) = (1_000, 0, UInt16(SC_KIND_GROUND_RADAR))
+        radar.affiliation = SimWorld.affiliationHostile
+        let target = try #require(world.spawn(radar))
+        var strike = ScUnitSpec()
+        (strike.vx, strike.kind) = (1, UInt16(SC_KIND_FIXED_WING_DRONE))
+        strike.affiliation = SimWorld.affiliationFriendly
+        (strike.options, strike.target_id) = (SimWorld.spawnPursuer, target)
+        (strike.speed_mps, strike.max_turn_rate_rad_s, strike.engagement_radius_m) = (100, 1, 10)
+        let pursuer = try #require(world.spawn(strike))
+        #expect(world.engagements.isEmpty)
+
+        var events: [ScEngagement] = []
+        for _ in 0..<300 where events.isEmpty {
+            world.step()
+            events = world.engagements
+        }
+        let e = try #require(events.first)
+        #expect(events.count == 1)
+        #expect((e.pursuer_id, e.target_id) == (pursuer, target))
+        #expect(e.target_kind == SC_KIND_GROUND_RADAR && e.target_affiliation == SimWorld.affiliationHostile)
+        #expect(e.flags == SimWorld.engagementSuccess | SimWorld.engagementTargetRemoved)
+        #expect((e.x, e.y, e.z) == (1_000, 0, 0))
+        #expect(e.tick == world.tick)
+        world.step()
+        #expect(world.engagements.isEmpty, "only the latest step's events")
+    }
+}

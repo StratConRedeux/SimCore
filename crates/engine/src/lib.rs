@@ -41,16 +41,8 @@ use simcore_rules::to_local_f32;
 /// Fixed timestep in seconds.
 pub const DT: f64 = 1.0 / TICKS_PER_SECOND as f64;
 
-/// Unit type codes (`ScUnitView::kind`).
-pub mod kind {
-    pub const UNKNOWN: u16 = 0;
-    pub const COMMAND_NODE: u16 = 1;
-    pub const QUADCOPTER: u16 = 2;
-    pub const FIXED_WING_DRONE: u16 = 3;
-    pub const GROUND_RADAR: u16 = 4;
-    pub const GROUND_VEHICLE: u16 = 5;
-    pub const JAMMER: u16 = 6;
-}
+/// Unit type codes, defined with the C API since revision 1.4.
+pub use simcore_abi::kind;
 
 /// The largest stable id a world can save and restore (`2^24 - 1`). [`Sim::spawn`] refuses to
 /// go past it.
@@ -545,7 +537,7 @@ impl Sim {
             .unwrap_or_default()
     }
 
-    /// Advances the world by `ticks` fixed steps of [`DT`] seconds. `step(0)` does nothing.
+    /// Advances the world by `ticks` fixed steps of [`DT`] seconds. `step(0)` runs no ticks.
     ///
     /// Clears the engagement events, then collects those of every tick run.
     pub fn step(&mut self, ticks: u32) {
@@ -557,7 +549,8 @@ impl Sim {
             let tick = self.world.resource::<SimClock>().tick + 1;
             // Engagement resolution removes units, so it runs with exclusive world access as
             // the last stage of the tick.
-            self.engagements.resolve(&mut self.world, tick);
+            let origin = self.command_node_position();
+            self.engagements.resolve(&mut self.world, tick, origin);
             self.world.resource_mut::<SimClock>().tick = tick;
             // Despawns (in `despawn_removed`) log removed components in double-buffered queues
             // that only this clears. Once per tick keeps them bounded (and their capacity

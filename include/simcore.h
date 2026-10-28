@@ -1,4 +1,4 @@
-/* SimCore C API, header revision 1.3 (ABI version 1). Must match crates/abi/src/lib.rs byte for byte. */
+/* SimCore C API, header revision 1.4 (ABI version 1). Must match crates/abi/src/lib.rs byte for byte. */
 #ifndef SIMCORE_H
 #define SIMCORE_H
 
@@ -27,6 +27,16 @@ static const uint8_t SC_AFFILIATION_UNKNOWN = 0;
 static const uint8_t SC_AFFILIATION_FRIENDLY = 1;
 static const uint8_t SC_AFFILIATION_HOSTILE = 2;
 static const uint8_t SC_AFFILIATION_NEUTRAL = 3;
+
+/* Unit type codes (ScUnitView.kind, ScUnitSpec.kind, ScEngagement.target_kind). In the
+   contract since revision 1.4; the values are unchanged. */
+static const uint16_t SC_KIND_UNKNOWN = 0;
+static const uint16_t SC_KIND_COMMAND_NODE = 1;
+static const uint16_t SC_KIND_QUADCOPTER = 2;
+static const uint16_t SC_KIND_FIXED_WING_DRONE = 3;
+static const uint16_t SC_KIND_GROUND_RADAR = 4;
+static const uint16_t SC_KIND_GROUND_VEHICLE = 5;
+static const uint16_t SC_KIND_JAMMER = 6;
 
 /* The unit is radiating (radar, datalink, jammer, weapon guidance). */
 static const uint8_t SC_FLAG_EMITTING = 1u << 0;
@@ -57,6 +67,38 @@ typedef struct ScFrame {
     uint32_t _reserved;
     uint64_t tick;
 } ScFrame;
+
+/* Revision 1.4: engagement events. Flags (ScEngagement.flags). */
+/* The roll succeeded. The pursuer is removed either way. */
+static const uint8_t SC_ENGAGEMENT_SUCCESS = 1u << 0;
+/* The target was removed: a success against anything but the command node. */
+static const uint8_t SC_ENGAGEMENT_TARGET_REMOVED = 1u << 1;
+/* A success against the command node, which stays (ScStatus.command_node_hits). */
+static const uint8_t SC_ENGAGEMENT_COMMAND_NODE_HIT = 1u << 2;
+
+/* One engagement resolved during the most recent sc_world_step. Position is where the target
+   was at the end of the engagement's tick, f32 metres relative to the command node at that
+   moment, east-north-up like ScUnitView. Kind and affiliation are recorded because a removed
+   target has left the frame. At most one of TARGET_REMOVED and COMMAND_NODE_HIT is set, and
+   either implies SUCCESS. 40 bytes. */
+typedef struct ScEngagement {
+    uint64_t tick; /* the tick count once the engagement's tick completed */
+    uint64_t pursuer_id;
+    uint64_t target_id;
+    float x, y, z;
+    uint16_t target_kind;
+    uint8_t target_affiliation;
+    uint8_t flags; /* SC_ENGAGEMENT_* */
+} ScEngagement;
+
+/* Read-only view of the latest step's engagements, in resolution order. `events` is
+   engine-owned and valid until the next sc_world_engagements or sc_world_destroy on the same
+   world. 16 bytes. */
+typedef struct ScEngagements {
+    const ScEngagement *SC_NULLABLE events; /* NULL when count is 0 or the call failed. */
+    uint32_t count;
+    uint32_t _reserved;
+} ScEngagements;
 
 /* Command types (ScCommand.type). */
 /* Travel straight to (x, y, z) at speed_mps, then stop. Replaces any earlier move. Not for
@@ -254,6 +296,11 @@ uint64_t sc_world_spawn(ScWorld *world, const ScUnitSpec *spec);
 /* Makes a live unit (the command node included) a passive sensor, replacing any previous one.
    NULL `sensor` uses the shared rules' parameters. False for an unknown unit or bad values. */
 bool sc_world_add_sensor(ScWorld *world, uint64_t unit_id, const ScSensor *SC_NULLABLE sensor);
+
+/* Engagements (revision 1.4). The engagements resolved during the most recent sc_world_step
+   call, however many ticks it ran; empty before the first step and after a restore. Calling it
+   again without stepping returns the same events. */
+ScEngagements sc_world_engagements(ScWorld *world);
 
 #if defined(__clang__)
 #pragma clang assume_nonnull end

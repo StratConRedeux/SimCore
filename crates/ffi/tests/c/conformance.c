@@ -56,6 +56,15 @@ _Static_assert(offsetof(ScUnitSpec, target_id) == 72, "spec target_id");
 _Static_assert(offsetof(ScUnitSpec, speed_mps) == 80, "spec speed_mps");
 _Static_assert(offsetof(ScUnitSpec, engagement_radius_m) == 104, "engagement_radius_m");
 _Static_assert(sizeof(ScSensor) == 16, "ScSensor size");
+_Static_assert(sizeof(ScEngagement) == 40, "ScEngagement size");
+_Static_assert(_Alignof(ScEngagement) == 8, "ScEngagement align");
+_Static_assert(offsetof(ScEngagement, pursuer_id) == 8, "pursuer_id");
+_Static_assert(offsetof(ScEngagement, target_id) == 16, "engagement target_id");
+_Static_assert(offsetof(ScEngagement, x) == 24, "engagement x");
+_Static_assert(offsetof(ScEngagement, target_kind) == 36, "engagement target_kind");
+_Static_assert(offsetof(ScEngagement, target_affiliation) == 38, "target_affiliation");
+_Static_assert(offsetof(ScEngagement, flags) == 39, "engagement flags");
+_Static_assert(sizeof(ScEngagements) == 16, "ScEngagements size");
 
 /* Every function, through a pointer of exactly the header's type. */
 static uint32_t (*const p_abi_version)(void) = sc_abi_version;
@@ -78,6 +87,7 @@ static bool (*const p_set_terrain)(ScWorld *, const ScTerrain *, const float *, 
     sc_world_set_terrain;
 static uint64_t (*const p_spawn)(ScWorld *, const ScUnitSpec *) = sc_world_spawn;
 static bool (*const p_add_sensor)(ScWorld *, uint64_t, const ScSensor *) = sc_world_add_sensor;
+static ScEngagements (*const p_engagements)(ScWorld *) = sc_world_engagements;
 
 static int failures = 0;
 #define CHECK(cond)                                                                \
@@ -267,7 +277,7 @@ int main(void) {
     CHECK(!p_set_terrain(g, &terrain, heights, 5));
     CHECK(p_set_terrain(g, NULL, NULL, 0));
 
-    ScUnitSpec radar = {.x = 1000.0, .erp_w = 50000.0f, .kind = 4,
+    ScUnitSpec radar = {.x = 1000.0, .erp_w = 50000.0f, .kind = SC_KIND_GROUND_RADAR,
                         .affiliation = SC_AFFILIATION_HOSTILE, .options = SC_SPAWN_EMITTING};
     uint64_t radar_id = p_spawn(g, &radar);
     CHECK(radar_id == 2);
@@ -275,7 +285,7 @@ int main(void) {
     bad_spec.options = SC_SPAWN_EMITTING | SC_SPAWN_CYCLE;
     CHECK(p_spawn(g, &bad_spec) == 0);
     CHECK(p_spawn(g, NULL) == 0);
-    ScUnitSpec strike = {.vx = 1.0, .erp_w = 1.0f, .kind = 3,
+    ScUnitSpec strike = {.vx = 1.0, .erp_w = 1.0f, .kind = SC_KIND_FIXED_WING_DRONE,
                          .affiliation = SC_AFFILIATION_FRIENDLY, .options = SC_SPAWN_PURSUER,
                          .outcome_class = 1, .target_id = radar_id, .speed_mps = 100.0,
                          .max_turn_rate_rad_s = 1.0, .engagement_radius_m = 10.0};
@@ -286,11 +296,27 @@ int main(void) {
     CHECK(!p_add_sensor(g, 99, &own));
 
     /* The node hears the radar; the strike reaches it in about 10 s and both are removed. */
+    CHECK(p_engagements(g).count == 0 && p_engagements(g).events == NULL);
     p_step(g, 5);
     CHECK(p_status(g).hostile_detected == 1);
     p_step(g, 200);
     ScStatus sg = p_status(g);
     CHECK(sg.unit_count == 1 && sg.awaiting_cleanup == 2);
+    /* Revision 1.4: the step that resolved it reports the kill, where the radar stood. */
+    ScEngagements eg = p_engagements(g);
+    CHECK(eg.count == 1 && eg.events != NULL);
+    if (eg.count == 1) {
+        ScEngagement ev = eg.events[0];
+        CHECK(ev.pursuer_id == 3 && ev.target_id == radar_id);
+        CHECK(ev.target_kind == SC_KIND_GROUND_RADAR);
+        CHECK(ev.target_affiliation == SC_AFFILIATION_HOSTILE);
+        CHECK(ev.flags == (SC_ENGAGEMENT_SUCCESS | SC_ENGAGEMENT_TARGET_REMOVED));
+        CHECK(ev.x == 1000.0f && ev.y == 0.0f && ev.z == 0.0f);
+        CHECK(ev.tick > 5 && ev.tick <= 205);
+    }
+    p_step(g, 1);
+    CHECK(p_engagements(g).count == 0);
+    CHECK(p_engagements(NULL).count == 0 && p_engagements(NULL).events == NULL);
     p_destroy(g);
 
     if (failures) {

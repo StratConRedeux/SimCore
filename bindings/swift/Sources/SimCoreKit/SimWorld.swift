@@ -214,3 +214,21 @@ extension SimWorld {
 /// Explicitly not Sendable: see the threading note on `SimWorld`.
 @available(*, unavailable)
 extension SimWorld: Sendable {}
+
+// MARK: - Contract revision 1.4: engagement events and kind codes
+
+extension SimWorld {
+    public static let engagementSuccess: UInt8 = SC_ENGAGEMENT_SUCCESS
+    public static let engagementTargetRemoved: UInt8 = SC_ENGAGEMENT_TARGET_REMOVED
+    public static let engagementCommandNodeHit: UInt8 = SC_ENGAGEMENT_COMMAND_NODE_HIT
+
+    /// The engagements resolved during the most recent `step`, however many ticks it ran, in
+    /// resolution order. Empty before the first step and after a restore. Copied out of the
+    /// engine; an empty result does not allocate.
+    public var engagements: [ScEngagement] {
+        // Its own buffer, separate from the frame's, so this is safe inside `withFrame`.
+        let e = sc_world_engagements(handle)
+        guard let events = e.events, e.count > 0 else { return [] }
+        return Array(UnsafeBufferPointer(start: events, count: Int(e.count)))
+    }
+}

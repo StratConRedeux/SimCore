@@ -18,6 +18,18 @@ pub mod affiliation {
     pub const NEUTRAL: u8 = 3;
 }
 
+/// Unit type codes (`ScUnitView::kind`, `ScUnitSpec::kind`, `ScEngagement::target_kind`).
+/// Revision 1.4 moved them into the contract; the values are unchanged.
+pub mod kind {
+    pub const UNKNOWN: u16 = 0;
+    pub const COMMAND_NODE: u16 = 1;
+    pub const QUADCOPTER: u16 = 2;
+    pub const FIXED_WING_DRONE: u16 = 3;
+    pub const GROUND_RADAR: u16 = 4;
+    pub const GROUND_VEHICLE: u16 = 5;
+    pub const JAMMER: u16 = 6;
+}
+
 /// Bit flags (`ScUnitView::flags`).
 pub mod flags {
     /// The unit is radiating (radar, datalink, jammer, weapon guidance).
@@ -257,6 +269,50 @@ pub struct ScUnitSpec {
     pub engagement_radius_m: f64,
 }
 
+/// Engagement flags (`ScEngagement::flags`).
+pub mod engagement {
+    /// The roll succeeded. The pursuer is removed either way.
+    pub const SUCCESS: u8 = 1 << 0;
+    /// The target was removed: a success against anything but the command node.
+    pub const TARGET_REMOVED: u8 = 1 << 1;
+    /// A success against the command node, which stays (`ScStatus::command_node_hits`).
+    pub const COMMAND_NODE_HIT: u8 = 1 << 2;
+}
+
+/// One engagement resolved during the most recent `sc_world_step`.
+///
+/// Position is where the target was at the end of the engagement's tick, in `f32` metres
+/// relative to the command node at that moment, east-north-up like [`ScUnitView`]. The target's
+/// kind and affiliation are recorded because a removed target has left the frame.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScEngagement {
+    /// The tick count once the engagement's tick completed.
+    pub tick: u64,
+    pub pursuer_id: u64,
+    pub target_id: u64,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub target_kind: u16,
+    pub target_affiliation: u8,
+    /// [`engagement`] bits. At most one of `TARGET_REMOVED` and `COMMAND_NODE_HIT` is set,
+    /// and either implies `SUCCESS`.
+    pub flags: u8,
+}
+
+/// A read-only view of the latest step's engagements, in resolution order.
+///
+/// `events` points into engine-owned memory and is valid until the next
+/// `sc_world_engagements` or `sc_world_destroy` on the same world.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ScEngagements {
+    pub events: *const ScEngagement,
+    pub count: u32,
+    pub _reserved: u32,
+}
+
 /// Passive sensor parameters for `sc_world_add_sensor`: an emitter of `reference_power_w` is
 /// heard out to `base_range_m`, scaling with the square root of power. Finite, non-negative.
 #[repr(C)]
@@ -315,4 +371,13 @@ const _: () = {
     assert!(core::mem::offset_of!(ScUnitView, flags) == 35);
     assert!(core::mem::offset_of!(ScUnitView, ems_power_w) == 36);
     assert!(core::mem::size_of::<ScFrame>() == 24);
+    assert!(core::mem::size_of::<ScEngagement>() == 40);
+    assert!(core::mem::align_of::<ScEngagement>() == 8);
+    assert!(core::mem::offset_of!(ScEngagement, pursuer_id) == 8);
+    assert!(core::mem::offset_of!(ScEngagement, target_id) == 16);
+    assert!(core::mem::offset_of!(ScEngagement, x) == 24);
+    assert!(core::mem::offset_of!(ScEngagement, target_kind) == 36);
+    assert!(core::mem::offset_of!(ScEngagement, target_affiliation) == 38);
+    assert!(core::mem::offset_of!(ScEngagement, flags) == 39);
+    assert!(core::mem::size_of::<ScEngagements>() == 16);
 };
