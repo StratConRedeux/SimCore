@@ -9,6 +9,7 @@ on:
       - "bindings/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "Package.swift"
       - ".github/workflows/swift.yml"
   pull_request:
     paths:
@@ -18,6 +19,7 @@ on:
       - "bindings/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "Package.swift"
       - ".github/workflows/swift.yml"
 
 permissions:
@@ -35,11 +37,20 @@ jobs:
           rustup default stable
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
           swift --version
+      - name: Validate root manifest
+        # Offline: loads Package.swift and checks its target paths, without fetching the release
+        # asset it points at (dump-package alone would miss a broken path).
+        run: swift package describe > /dev/null
       - name: Build XCFramework
         run: scripts/build-xcframework.sh
       - name: Swift tests (macOS)
         working-directory: bindings/swift
         run: swift test
+      - name: Root manifest tests (macOS, local zip)
+        # Builds and tests the root manifest itself, with the binary target swapped for this zip.
+        run: |
+          ditto -c -k --keepParent build/SimCore.xcframework build/SimCore.xcframework.zip
+          scripts/check-root-manifest.sh build/SimCore.xcframework.zip
       - name: Build tests for iOS
         # Apple Silicon simulators only; the XCFramework has no x86_64 simulator slice.
         working-directory: bindings/swift

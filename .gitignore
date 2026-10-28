@@ -5,3 +5,5 @@
 /build/
 /bindings/swift/.build/
 /bindings/swift/.swiftpm/
+/.build/
+/.swiftpm/

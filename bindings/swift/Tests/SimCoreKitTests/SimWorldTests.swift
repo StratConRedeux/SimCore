@@ -26,6 +26,17 @@ private func frameBytes(_ world: SimWorld) -> [UInt8] {
         #expect(SimWorld.abiVersion == UInt32(SC_ABI_VERSION))
     }
 
+    @Test func flagConstantsMatchHeader() {
+        #expect(SimWorld.flagEmitting == 1 << 0)
+        #expect(SimWorld.flagCommandNode == 1 << 1)
+        #expect(SimWorld.flagDetected == 1 << 2)
+        #expect(SimWorld.flagDetected == SC_FLAG_DETECTED)
+        // Distinct bits, so they can be tested independently in `ScUnitView.flags`.
+        let all = [SimWorld.flagEmitting, SimWorld.flagCommandNode, SimWorld.flagDetected]
+        #expect(all.reduce(0, |) == 0b111)
+        #expect(SimWorld.affiliationUnknown == 0)
+    }
+
     @Test func emptyWorldHasOnlyTheCommandNode() throws {
         let world = try #require(SimWorld(seed: 1))
         #expect(world.withFrame { $0.count } == 1)

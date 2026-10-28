@@ -31,14 +31,16 @@ public final class SimWorld {
     /// The ABI version of the linked engine (`SC_ABI_VERSION` when they match).
     public static var abiVersion: UInt32 { sc_abi_version() }
 
-    // The header's `#define` constants import as `Int32` (or `UInt32` for `1u << n`); these
-    // are the same values with the types of the fields and parameters they go with.
-    public static let ticksPerSecond = UInt32(SC_TICKS_PER_SECOND)
-    public static let flagEmitting = UInt8(SC_FLAG_EMITTING)
-    public static let flagCommandNode = UInt8(SC_FLAG_COMMAND_NODE)
-    public static let affiliationFriendly = UInt8(SC_AFFILIATION_FRIENDLY)
-    public static let affiliationHostile = UInt8(SC_AFFILIATION_HOSTILE)
-    public static let affiliationNeutral = UInt8(SC_AFFILIATION_NEUTRAL)
+    // The header's typed constants (revision 1.1) already import with the types of the fields
+    // and parameters they go with; these are Swift-style names for them.
+    public static let ticksPerSecond: UInt32 = SC_TICKS_PER_SECOND
+    public static let flagEmitting: UInt8 = SC_FLAG_EMITTING
+    public static let flagCommandNode: UInt8 = SC_FLAG_COMMAND_NODE
+    public static let flagDetected: UInt8 = SC_FLAG_DETECTED
+    public static let affiliationUnknown: UInt8 = SC_AFFILIATION_UNKNOWN
+    public static let affiliationFriendly: UInt8 = SC_AFFILIATION_FRIENDLY
+    public static let affiliationHostile: UInt8 = SC_AFFILIATION_HOSTILE
+    public static let affiliationNeutral: UInt8 = SC_AFFILIATION_NEUTRAL
 
     /// Advances `ticks` fixed steps of `1 / SC_TICKS_PER_SECOND` seconds.
     public func step(_ ticks: UInt32 = 1) {
@@ -61,7 +63,11 @@ public final class SimWorld {
         readingFrame = true
         defer { readingFrame = false }
         let frame = sc_world_frame(handle)
-        return try body(UnsafeBufferPointer(start: frame.units, count: Int(frame.count)))
+        // `units` is NULL when the frame is empty or the call failed; both read as no units.
+        guard let units = frame.units else {
+            return try body(UnsafeBufferPointer(start: nil, count: 0))
+        }
+        return try body(UnsafeBufferPointer(start: units, count: Int(frame.count)))
     }
 }
 
