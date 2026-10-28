@@ -31,7 +31,7 @@ const MAGIC: &[u8; 4] = b"SCSN";
 const HEADER_LEN: usize = 4 + 4 + 8 + 8;
 /// Stable ids are below this. The id index is 8 bytes per id up to the largest, so this caps
 /// what a snapshot can make the engine allocate at 128 MiB (16.7 million units ever spawned).
-const MAX_ID: u64 = 1 << 24;
+const MAX_ID: u64 = crate::MAX_UNIT_ID + 1;
 /// Ticks and command ids are below this, so no later arithmetic on them can overflow.
 const MAX_COUNTER: u64 = 1 << 62;
 

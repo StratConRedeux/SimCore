@@ -12,9 +12,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub use simcore_abi::{
-    ABI_VERSION, ScBytes, ScCommand, ScFrame, ScStatus, ScUnitView, TICKS_PER_SECOND, command,
+    ABI_VERSION, ScBytes, ScCommand, ScFrame, ScLinkRules, ScOutcome, ScRules, ScSensor, ScStatus,
+    ScTerrain, ScUnitSpec, ScUnitView, TICKS_PER_SECOND, command, spawn,
 };
-use simcore_engine::{Order, Position, Sim, StableId};
+use simcore_engine::{
+    EmitterCycle, EmsProfile, LinkRules, Order, OutcomeTable, Position, Pursuer, Rules, Sensor,
+    SensorParams, Sim, StableId, Terrain, UnitSpec, Velocity,
+};
 
 /// Opaque world handle (`ScWorld` in the header). C only ever sees a pointer to it.
 pub struct ScWorld {
@@ -294,6 +298,287 @@ pub unsafe extern "C" fn sc_world_restore(data: *const u8, len: u64) -> *mut ScW
     })
 }
 
+/// Finite and non-negative: what every distance, power, rate and chance in the setup structs
+/// must be.
+fn non_negative(x: f64) -> bool {
+    x >= 0.0 && x.is_finite()
+}
+
+fn chance(x: f64) -> bool {
+    (0.0..=1.0).contains(&x)
+}
+
+/// The command node's world position, which setup coordinates are relative to.
+fn node(sim: &Sim) -> Position {
+    sim.position(StableId(1)).unwrap_or_default()
+}
+
+/// Checks and converts C rules. `None` if any value is out of range, a reserved field is set,
+/// or a (class, kind) pair repeats.
+fn rules(r: &ScRules, outcomes: &[ScOutcome]) -> Option<Rules> {
+    let values_ok = r._reserved == 0
+        && non_negative(r.detection_max_range_m)
+        && non_negative(r.sensor_base_range_m)
+        && non_negative(r.sensor_reference_power_w)
+        && chance(r.default_chance);
+    if !values_ok {
+        return None;
+    }
+    let mut table = OutcomeTable::new(r.default_chance);
+    for o in outcomes {
+        if o._reserved != 0 || !chance(o.chance) {
+            return None;
+        }
+        table.set(o.outcome_class, o.target_kind, o.chance);
+    }
+    // `set` replaces repeats, so a repeat shows as a shorter table.
+    if table.entries().len() != outcomes.len() {
+        return None;
+    }
+    Some(Rules {
+        detection_max_range_m: r.detection_max_range_m,
+        sensor: SensorParams {
+            base_range_m: r.sensor_base_range_m,
+            reference_power_w: r.sensor_reference_power_w,
+        },
+        exposure_threshold_ticks: r.exposure_threshold_ticks,
+        exposure_cap_ticks: r.exposure_cap_ticks,
+        exposure_decay_per_tick: r.exposure_decay_per_tick,
+        outcomes: table,
+    })
+}
+
+/// `bool sc_world_set_rules(ScWorld *world, const ScRules *rules, const ScOutcome *outcomes,
+/// uint32_t outcome_count);` False, with nothing changed, on NULL, bad values or failure.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread; `rules` is
+/// NULL or points to a readable `ScRules`; `outcomes` is NULL or points to `outcome_count`
+/// readable `ScOutcome`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_set_rules(
+    world: *mut ScWorld,
+    rules: *const ScRules,
+    outcomes: *const ScOutcome,
+    outcome_count: u32,
+) -> bool {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return false;
+    };
+    // SAFETY: NULL or a readable ScRules (caller contract). Copied out at once.
+    let Some(r) = (unsafe { rules.as_ref() }).copied() else {
+        return false;
+    };
+    let outcomes: &[ScOutcome] = match (outcomes.is_null(), outcome_count) {
+        (_, 0) => &[],
+        (true, _) => return false,
+        // SAFETY: non-null and `outcome_count` readable entries (caller contract); at most
+        // 2^32 * 16 bytes, within `isize::MAX` on 64-bit targets.
+        (false, n) => unsafe { std::slice::from_raw_parts(outcomes, n as usize) },
+    };
+    guard(false, || match self::rules(&r, outcomes) {
+        Some(rules) => {
+            w.sim.set_rules(rules);
+            true
+        }
+        None => false,
+    })
+}
+
+/// `bool sc_world_set_link_rules(ScWorld *world, const ScLinkRules *rules);` False, with
+/// nothing changed, on NULL, bad values or failure.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread; `rules` is
+/// NULL or points to a readable `ScLinkRules`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_set_link_rules(
+    world: *mut ScWorld,
+    rules: *const ScLinkRules,
+) -> bool {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return false;
+    };
+    // SAFETY: NULL or a readable ScLinkRules (caller contract). Copied out at once.
+    let Some(r) = (unsafe { rules.as_ref() }).copied() else {
+        return false;
+    };
+    if r._reserved != 0 || !non_negative(r.delay_ticks_per_km) || !non_negative(r.jam_radius_m) {
+        return false;
+    }
+    guard(false, || {
+        w.sim.set_link_rules(LinkRules {
+            base_delay_ticks: r.base_delay_ticks,
+            delay_ticks_per_km: r.delay_ticks_per_km,
+            jam_radius_m: r.jam_radius_m,
+            jam_delay_ticks: r.jam_delay_ticks,
+            max_delay_ticks: r.max_delay_ticks,
+        });
+        true
+    })
+}
+
+/// `bool sc_world_set_terrain(ScWorld *world, const ScTerrain *terrain, const float *heights,
+/// uint64_t height_count);` NULL `terrain` sets flat terrain. False, with nothing changed, on a
+/// NULL world, bad values or failure.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread; `terrain` is
+/// NULL or points to a readable `ScTerrain`; `heights` is NULL or points to `height_count`
+/// readable floats that are not modified during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_set_terrain(
+    world: *mut ScWorld,
+    terrain: *const ScTerrain,
+    heights: *const f32,
+    height_count: u64,
+) -> bool {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return false;
+    };
+    // SAFETY: NULL or a readable ScTerrain (caller contract). Copied out at once.
+    let Some(t) = (unsafe { terrain.as_ref() }).copied() else {
+        return guard(false, || {
+            w.sim.set_terrain(Terrain::flat());
+            true
+        });
+    };
+    // The snapshot stores the sample count as a u32; nx * ny must match it anyway.
+    if t._reserved != 0 || heights.is_null() || height_count > u64::from(u32::MAX) {
+        return false;
+    }
+    // SAFETY: non-null and `height_count` readable, unmodified floats (caller contract); at
+    // most 2^32 * 4 bytes, within `isize::MAX` on 64-bit targets.
+    let heights = unsafe { std::slice::from_raw_parts(heights, height_count as usize) };
+    guard(false, || {
+        let o = node(&w.sim);
+        let terrain = Terrain::heightfield(
+            o.x + t.origin_x,
+            o.y + t.origin_y,
+            t.spacing_m,
+            t.nx,
+            t.ny,
+            heights.to_vec(),
+            t.los_samples,
+        );
+        match terrain {
+            Some(terrain) => {
+                w.sim.set_terrain(terrain);
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// Converts a C spawn spec, resolving its position relative to the command node. `None` for
+/// unknown option bits, continuous emission with a duty cycle, or a set reserved field;
+/// [`Sim::spawn`] checks the values.
+fn unit_spec(sim: &Sim, s: &ScUnitSpec) -> Option<(UnitSpec, Option<Pursuer>)> {
+    const KNOWN: u8 = spawn::EMITTING | spawn::CYCLE | spawn::PURSUER | spawn::SENSOR;
+    let has = |bit: u8| s.options & bit != 0;
+    if s._reserved != 0 || s.options & !KNOWN != 0 || (has(spawn::EMITTING) && has(spawn::CYCLE)) {
+        return None;
+    }
+    let o = node(sim);
+    let spec = UnitSpec {
+        kind: s.kind,
+        affiliation: s.affiliation,
+        position: Position {
+            x: o.x + s.x,
+            y: o.y + s.y,
+            z: o.z + s.z,
+        },
+        velocity: Velocity {
+            x: s.vx,
+            y: s.vy,
+            z: s.vz,
+        },
+        ems: EmsProfile {
+            emitting: has(spawn::EMITTING),
+            erp_w: s.erp_w,
+        },
+        cycle: has(spawn::CYCLE).then_some(EmitterCycle {
+            on_ticks: s.cycle_on_ticks,
+            off_ticks: s.cycle_off_ticks,
+            phase: s.cycle_phase,
+        }),
+    };
+    let pursuer = has(spawn::PURSUER).then_some(Pursuer {
+        target: StableId(s.target_id),
+        speed: s.speed_mps,
+        max_turn_rate: s.max_turn_rate_rad_s,
+        lead: s.lead,
+        engagement_radius_m: s.engagement_radius_m,
+        outcome_class: s.outcome_class,
+    });
+    Some((spec, pursuer))
+}
+
+/// `uint64_t sc_world_spawn(ScWorld *world, const ScUnitSpec *spec);` Returns the new unit's
+/// id, or 0, with nothing changed, on NULL, a rejected spec, exhausted ids or failure.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread; `spec` is
+/// NULL or points to a readable `ScUnitSpec`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_spawn(world: *mut ScWorld, spec: *const ScUnitSpec) -> u64 {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return 0;
+    };
+    // SAFETY: NULL or a readable ScUnitSpec (caller contract). Copied out at once.
+    let Some(s) = (unsafe { spec.as_ref() }).copied() else {
+        return 0;
+    };
+    guard(0, || {
+        let Some((spec, pursuer)) = unit_spec(&w.sim, &s) else {
+            return 0;
+        };
+        let Ok(id) = w.sim.spawn(spec, pursuer) else {
+            return 0;
+        };
+        if s.options & spawn::SENSOR != 0 {
+            w.sim.add_sensor(id, Sensor::default());
+        }
+        id.0
+    })
+}
+
+/// `bool sc_world_add_sensor(ScWorld *world, uint64_t unit_id, const ScSensor *sensor);` NULL
+/// `sensor` uses the shared rules' parameters. False, with nothing changed, on a NULL world,
+/// an unknown unit, bad values or failure.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread; `sensor` is
+/// NULL or points to a readable `ScSensor`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_add_sensor(
+    world: *mut ScWorld,
+    unit_id: u64,
+    sensor: *const ScSensor,
+) -> bool {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return false;
+    };
+    // SAFETY: NULL or a readable ScSensor (caller contract). Copied out at once.
+    let params = (unsafe { sensor.as_ref() }).copied();
+    if params.is_some_and(|p| !non_negative(p.base_range_m) || !non_negative(p.reference_power_w)) {
+        return false;
+    }
+    let sensor = Sensor {
+        params: params.map(|p| SensorParams {
+            base_range_m: p.base_range_m,
+            reference_power_w: p.reference_power_w,
+        }),
+    };
+    guard(false, || w.sim.add_sensor(StableId(unit_id), sensor))
+}
+
 /// The exports with the exact C signatures from `include/simcore.h`. If a signature drifts,
 /// this stops compiling.
 const _: () = {
@@ -310,6 +595,13 @@ const _: () = {
     let _: unsafe extern "C" fn(*mut ScWorld, *const ScCommand) -> u64 = sc_world_command;
     let _: unsafe extern "C" fn(*mut ScWorld) -> ScBytes = sc_world_save;
     let _: unsafe extern "C" fn(*const u8, u64) -> *mut ScWorld = sc_world_restore;
+    let _: unsafe extern "C" fn(*mut ScWorld, *const ScRules, *const ScOutcome, u32) -> bool =
+        sc_world_set_rules;
+    let _: unsafe extern "C" fn(*mut ScWorld, *const ScLinkRules) -> bool = sc_world_set_link_rules;
+    let _: unsafe extern "C" fn(*mut ScWorld, *const ScTerrain, *const f32, u64) -> bool =
+        sc_world_set_terrain;
+    let _: unsafe extern "C" fn(*mut ScWorld, *const ScUnitSpec) -> u64 = sc_world_spawn;
+    let _: unsafe extern "C" fn(*mut ScWorld, u64, *const ScSensor) -> bool = sc_world_add_sensor;
 };
 
 #[cfg(test)]
@@ -465,6 +757,461 @@ mod tests {
             sc_world_despawn_removed(w);
             sc_world_destroy(w);
             sc_world_destroy(r);
+        }
+    }
+
+    fn unit_at(x: f64, y: f64, aff: u8, kind: u16) -> ScUnitSpec {
+        ScUnitSpec {
+            x,
+            y,
+            erp_w: 100.0,
+            kind,
+            affiliation: aff,
+            ..ScUnitSpec::default()
+        }
+    }
+
+    fn frame_of(w: *mut ScWorld) -> Vec<ScUnitView> {
+        // SAFETY: `w` is a live handle on this thread; the units are copied out before any
+        // other call on it.
+        unsafe {
+            let f = sc_world_frame(w);
+            let mut v = std::slice::from_raw_parts(f.units, f.count as usize).to_vec();
+            v.sort_by_key(|u| u.id);
+            v
+        }
+    }
+
+    #[test]
+    fn setup_calls_reject_bad_input_and_change_nothing() {
+        use simcore_abi::affiliation::{FRIENDLY, HOSTILE};
+        use simcore_engine::kind;
+        let w = sc_world_create(1);
+        // SAFETY: `w` is a live handle used only on this thread and destroyed once; every
+        // pointer passed points to a live local of the right type and count.
+        unsafe {
+            let null = std::ptr::null_mut();
+            let good_rules = ScRules {
+                detection_max_range_m: 5000.0,
+                default_chance: 0.5,
+                ..ScRules::default()
+            };
+            assert!(!sc_world_set_rules(null, &good_rules, std::ptr::null(), 0));
+            assert!(!sc_world_set_rules(
+                w,
+                std::ptr::null(),
+                std::ptr::null(),
+                0
+            ));
+            assert!(!sc_world_set_rules(w, &good_rules, std::ptr::null(), 1));
+            for bad in [
+                ScRules {
+                    _reserved: 1,
+                    ..good_rules
+                },
+                ScRules {
+                    default_chance: 1.5,
+                    ..good_rules
+                },
+                ScRules {
+                    detection_max_range_m: -1.0,
+                    ..good_rules
+                },
+                ScRules {
+                    sensor_base_range_m: f64::INFINITY,
+                    ..good_rules
+                },
+                ScRules {
+                    sensor_reference_power_w: f64::NAN,
+                    ..good_rules
+                },
+            ] {
+                assert!(!sc_world_set_rules(w, &bad, std::ptr::null(), 0), "{bad:?}");
+            }
+            let o = ScOutcome {
+                outcome_class: 1,
+                target_kind: 4,
+                _reserved: 0,
+                chance: 1.0,
+            };
+            for bad in [
+                [o, o],
+                [
+                    o,
+                    ScOutcome {
+                        chance: -0.1,
+                        target_kind: 5,
+                        ..o
+                    },
+                ],
+                [
+                    o,
+                    ScOutcome {
+                        _reserved: 1,
+                        target_kind: 5,
+                        ..o
+                    },
+                ],
+            ] {
+                assert!(
+                    !sc_world_set_rules(w, &good_rules, bad.as_ptr(), 2),
+                    "{bad:?}"
+                );
+            }
+            assert_eq!(
+                (*w).sim.rules(),
+                &Rules::default(),
+                "rejections change nothing"
+            );
+            let two = [
+                o,
+                ScOutcome {
+                    target_kind: 5,
+                    chance: 0.0,
+                    ..o
+                },
+            ];
+            assert!(sc_world_set_rules(w, &good_rules, two.as_ptr(), 2));
+            let r = (*w).sim.rules();
+            assert_eq!(r.outcomes.chance(1, 4), 1.0);
+            assert_eq!(r.outcomes.chance(1, 5), 0.0);
+            assert_eq!(r.outcomes.chance(9, 9), 0.5);
+
+            let link = ScLinkRules {
+                base_delay_ticks: 3,
+                max_delay_ticks: 100,
+                ..ScLinkRules::default()
+            };
+            assert!(!sc_world_set_link_rules(w, std::ptr::null()));
+            assert!(!sc_world_set_link_rules(
+                w,
+                &ScLinkRules {
+                    jam_radius_m: -1.0,
+                    ..link
+                }
+            ));
+            assert!(!sc_world_set_link_rules(
+                w,
+                &ScLinkRules {
+                    delay_ticks_per_km: f64::NAN,
+                    ..link
+                }
+            ));
+            assert!(!sc_world_set_link_rules(
+                w,
+                &ScLinkRules {
+                    _reserved: 7,
+                    ..link
+                }
+            ));
+            assert_eq!(sc_world_link_delay(w, 1), 0);
+            assert!(sc_world_set_link_rules(w, &link));
+            assert_eq!(sc_world_link_delay(w, 1), 3);
+
+            let t = ScTerrain {
+                spacing_m: 100.0,
+                nx: 2,
+                ny: 2,
+                los_samples: 8,
+                ..ScTerrain::default()
+            };
+            let h = [0.0f32, 10.0, 20.0, 30.0];
+            assert!(!sc_world_set_terrain(w, &t, std::ptr::null(), 4));
+            assert!(
+                !sc_world_set_terrain(w, &t, h.as_ptr(), 3),
+                "count must be nx * ny"
+            );
+            assert!(!sc_world_set_terrain(
+                w,
+                &ScTerrain {
+                    los_samples: 1025,
+                    ..t
+                },
+                h.as_ptr(),
+                4
+            ));
+            assert!(!sc_world_set_terrain(
+                w,
+                &ScTerrain { _reserved: 1, ..t },
+                h.as_ptr(),
+                4
+            ));
+            let nan = [0.0f32, f32::NAN, 0.0, 0.0];
+            assert!(!sc_world_set_terrain(w, &t, nan.as_ptr(), 4));
+            assert!((*w).sim.terrain().is_flat());
+            assert!(sc_world_set_terrain(w, &t, h.as_ptr(), 4));
+            assert_eq!((*w).sim.terrain().height_at(100.0, 100.0), 30.0);
+            assert!(sc_world_set_terrain(
+                w,
+                std::ptr::null(),
+                std::ptr::null(),
+                0
+            ));
+            assert!((*w).sim.terrain().is_flat());
+
+            let radar = unit_at(500.0, 0.0, HOSTILE, kind::GROUND_RADAR);
+            let strike = ScUnitSpec {
+                options: spawn::PURSUER,
+                target_id: 2,
+                speed_mps: 50.0,
+                max_turn_rate_rad_s: 1.0,
+                engagement_radius_m: 5.0,
+                ..unit_at(0.0, 0.0, FRIENDLY, kind::FIXED_WING_DRONE)
+            };
+            assert_eq!(sc_world_spawn(null, &radar), 0);
+            assert_eq!(sc_world_spawn(w, std::ptr::null()), 0);
+            assert_eq!(sc_world_spawn(w, &strike), 0, "target 2 does not exist yet");
+            for bad in [
+                ScUnitSpec {
+                    x: f64::NAN,
+                    ..radar
+                },
+                ScUnitSpec {
+                    vz: f64::INFINITY,
+                    ..radar
+                },
+                ScUnitSpec {
+                    erp_w: -1.0,
+                    ..radar
+                },
+                ScUnitSpec {
+                    affiliation: 4,
+                    ..radar
+                },
+                ScUnitSpec {
+                    kind: kind::COMMAND_NODE,
+                    ..radar
+                },
+                ScUnitSpec {
+                    options: 1 << 4,
+                    ..radar
+                },
+                ScUnitSpec {
+                    options: spawn::EMITTING | spawn::CYCLE,
+                    ..radar
+                },
+                ScUnitSpec {
+                    _reserved: 1,
+                    ..radar
+                },
+            ] {
+                assert_eq!(sc_world_spawn(w, &bad), 0, "{bad:?}");
+            }
+            assert_eq!(sc_world_status(w).unit_count, 1, "rejections spawn nothing");
+            assert_eq!(sc_world_spawn(w, &radar), 2);
+            for bad in [
+                ScUnitSpec {
+                    speed_mps: 0.0,
+                    ..strike
+                },
+                ScUnitSpec {
+                    lead: 1.5,
+                    ..strike
+                },
+                ScUnitSpec {
+                    max_turn_rate_rad_s: -1.0,
+                    ..strike
+                },
+                ScUnitSpec {
+                    engagement_radius_m: f64::NAN,
+                    ..strike
+                },
+                ScUnitSpec {
+                    target_id: 99,
+                    ..strike
+                },
+            ] {
+                assert_eq!(sc_world_spawn(w, &bad), 0, "{bad:?}");
+            }
+            assert_eq!(
+                sc_world_spawn(w, &strike),
+                3,
+                "ids are not used up by rejections"
+            );
+
+            let s = ScSensor {
+                base_range_m: 1000.0,
+                reference_power_w: 1.0,
+            };
+            assert!(!sc_world_add_sensor(null, 1, &s));
+            assert!(!sc_world_add_sensor(w, 99, &s));
+            assert!(!sc_world_add_sensor(
+                w,
+                1,
+                &ScSensor {
+                    base_range_m: -1.0,
+                    ..s
+                }
+            ));
+            assert!(sc_world_add_sensor(w, 1, &s));
+            assert!(sc_world_add_sensor(w, 2, std::ptr::null()));
+            sc_world_destroy(w);
+        }
+    }
+
+    #[test]
+    fn scenario_built_over_the_c_api_plays_and_survives_save_restore() {
+        use simcore_abi::affiliation::{FRIENDLY, HOSTILE};
+        use simcore_engine::kind;
+        let w = sc_world_create(42);
+        // SAFETY: `w` and `r` are live handles used only on this thread, each destroyed once;
+        // pointers point to live locals; snapshot bytes are copied before the next call on `w`.
+        unsafe {
+            let rules = ScRules {
+                detection_max_range_m: 20_000.0,
+                sensor_base_range_m: 2_000.0,
+                sensor_reference_power_w: 1.0,
+                default_chance: 0.0,
+                exposure_threshold_ticks: 3,
+                exposure_cap_ticks: 30,
+                exposure_decay_per_tick: 1,
+                _reserved: 0,
+            };
+            let hit = [ScOutcome {
+                outcome_class: 7,
+                target_kind: kind::GROUND_RADAR,
+                _reserved: 0,
+                chance: 1.0,
+            }];
+            assert!(sc_world_set_rules(w, &rules, hit.as_ptr(), 1));
+            let link = ScLinkRules {
+                base_delay_ticks: 2,
+                delay_ticks_per_km: 1.0,
+                max_delay_ticks: 60,
+                ..ScLinkRules::default()
+            };
+            assert!(sc_world_set_link_rules(w, &link));
+            assert!(sc_world_add_sensor(w, 1, std::ptr::null()));
+            // A hostile radar 3 km east, always on: 50 kW is heard out to 2 km * sqrt(50000).
+            let radar = sc_world_spawn(
+                w,
+                &ScUnitSpec {
+                    erp_w: 50_000.0,
+                    options: spawn::EMITTING,
+                    ..unit_at(3_000.0, 0.0, HOSTILE, kind::GROUND_RADAR)
+                },
+            );
+            // A friendly quadcopter on a duty cycle, with its own sensor.
+            let drone = sc_world_spawn(
+                w,
+                &ScUnitSpec {
+                    z: 100.0,
+                    erp_w: 1.0,
+                    options: spawn::CYCLE | spawn::SENSOR,
+                    cycle_on_ticks: 5,
+                    cycle_off_ticks: 10,
+                    ..unit_at(-200.0, 0.0, FRIENDLY, kind::QUADCOPTER)
+                },
+            );
+            // A strike on the radar, launched eastward from the node.
+            let strike = sc_world_spawn(
+                w,
+                &ScUnitSpec {
+                    vx: 1.0,
+                    options: spawn::PURSUER,
+                    target_id: radar,
+                    outcome_class: 7,
+                    speed_mps: 100.0,
+                    max_turn_rate_rad_s: 1.0,
+                    engagement_radius_m: 10.0,
+                    ..unit_at(0.0, 0.0, FRIENDLY, kind::FIXED_WING_DRONE)
+                },
+            );
+            assert_eq!((radar, drone, strike), (2, 3, 4));
+            let f = frame_of(w);
+            assert_eq!(f.len(), 4);
+            assert_eq!(
+                (f[1].x, f[1].kind, f[1].affiliation),
+                (3_000.0, kind::GROUND_RADAR, HOSTILE)
+            );
+            assert!(f[1].flags & simcore_abi::flags::EMITTING != 0);
+            assert!(
+                f[2].flags & simcore_abi::flags::EMITTING != 0,
+                "cycle on at tick 0"
+            );
+            // 2 base + ceil(3 km * 1/km).
+            assert_eq!(sc_world_link_delay(w, radar), 5);
+            assert!(
+                sc_world_command(
+                    w,
+                    &ScCommand {
+                        unit_id: drone,
+                        x: -200.0,
+                        y: 300.0,
+                        z: 100.0,
+                        speed_mps: 10.0,
+                        type_: command::MOVE,
+                        ..ScCommand::default()
+                    }
+                ) > 0
+            );
+
+            sc_world_step(w, 10);
+            assert_eq!(
+                sc_world_status(w).hostile_detected,
+                1,
+                "the node hears the radar"
+            );
+            let saved = {
+                let b = sc_world_save(w);
+                std::slice::from_raw_parts(b.data, b.len as usize).to_vec()
+            };
+            let r = sc_world_restore(saved.as_ptr(), saved.len() as u64);
+            assert!(!r.is_null());
+            // 3 km at 100 m/s: about 30 s, 450 ticks. Both worlds play it identically.
+            for _ in 0..60 {
+                sc_world_step(w, 10);
+                sc_world_step(r, 10);
+                assert_eq!(frame_of(w), frame_of(r));
+                assert_eq!(sc_world_status(w), sc_world_status(r));
+            }
+            let s = sc_world_status(w);
+            assert_eq!(
+                s.unit_count, 2,
+                "the strike removed the radar and itself: {s:?}"
+            );
+            let ids: Vec<u64> = frame_of(w).iter().map(|u| u.id).collect();
+            assert_eq!(ids, [1, drone]);
+            let d = frame_of(w)[1];
+            assert!(
+                (d.y - 300.0).abs() < 0.5 && d.vy == 0.0,
+                "the drone arrived: {d:?}"
+            );
+            // Ids are never reused.
+            assert_eq!(
+                sc_world_spawn(w, &unit_at(0.0, 0.0, FRIENDLY, kind::QUADCOPTER)),
+                5
+            );
+            sc_world_destroy(w);
+            sc_world_destroy(r);
+        }
+    }
+
+    #[test]
+    fn setup_coordinates_are_relative_to_the_command_node() {
+        let w = sc_world_create(1);
+        // SAFETY: `w` is a live handle used only on this thread and destroyed once.
+        unsafe {
+            (*w).sim.set_command_node_position(Position {
+                x: 1e6,
+                y: -2e6,
+                z: 50.0,
+            });
+            let id = sc_world_spawn(w, &unit_at(10.0, 20.0, 1, simcore_engine::kind::QUADCOPTER));
+            let p = (*w).sim.position(StableId(id)).unwrap();
+            assert_eq!((p.x, p.y, p.z), (1e6 + 10.0, -2e6 + 20.0, 50.0));
+            let t = ScTerrain {
+                origin_x: -5.0,
+                origin_y: 5.0,
+                spacing_m: 1.0,
+                nx: 1,
+                ny: 1,
+                ..ScTerrain::default()
+            };
+            assert!(sc_world_set_terrain(w, &t, [7.0f32].as_ptr(), 1));
+            let (ox, oy, ..) = (*w).sim.terrain().parts().unwrap();
+            assert_eq!((ox, oy), (1e6 - 5.0, -2e6 + 5.0));
+            sc_world_destroy(w);
         }
     }
 

@@ -168,3 +168,64 @@ private enum Environment {
         #expect(w.tick == 310)
     }
 }
+
+@Suite struct ContractRevision13Tests {
+    @Test func setupLayoutsMatchHeader() {
+        #expect(MemoryLayout<ScRules>.size == 48)
+        #expect(MemoryLayout<ScOutcome>.size == 16)
+        #expect(MemoryLayout<ScLinkRules>.size == 32)
+        #expect(MemoryLayout<ScTerrain>.size == 40)
+        #expect(MemoryLayout<ScUnitSpec>.size == 112)
+        #expect(MemoryLayout<ScUnitSpec>.offset(of: \.options) == 55)
+        #expect(MemoryLayout<ScUnitSpec>.offset(of: \.target_id) == 72)
+        #expect(MemoryLayout<ScSensor>.size == 16)
+    }
+
+    @Test func aStrikeBuiltFromSwiftReachesItsTarget() throws {
+        let world = try #require(SimWorld(seed: 3))
+        var rules = ScRules()
+        rules.detection_max_range_m = 20_000
+        rules.sensor_base_range_m = 2_000
+        rules.sensor_reference_power_w = 1
+        rules.exposure_threshold_ticks = 2
+        rules.exposure_cap_ticks = 10
+        rules.exposure_decay_per_tick = 1
+        var hit = ScOutcome()
+        (hit.outcome_class, hit.target_kind, hit.chance) = (1, 4, 1)
+        #expect(world.setRules(rules, outcomes: [hit]))
+        #expect(!world.setRules(rules, outcomes: [hit, hit]), "repeated pair")
+        var link = ScLinkRules()
+        (link.base_delay_ticks, link.max_delay_ticks) = (3, 30)
+        #expect(world.setLinkRules(link))
+        #expect(world.linkDelay(unit: 1) == 3)
+        var terrain = ScTerrain()
+        (terrain.spacing_m, terrain.nx, terrain.ny, terrain.los_samples) = (100, 2, 1, 4)
+        #expect(world.setTerrain(terrain, heights: [0, 0]))
+        #expect(!world.setTerrain(terrain, heights: [0]))
+        #expect(world.setTerrain(nil))
+
+        var radar = ScUnitSpec()
+        (radar.x, radar.erp_w, radar.kind) = (1_000, 50_000, 4)
+        radar.affiliation = SimWorld.affiliationHostile
+        radar.options = SimWorld.spawnEmitting
+        let target = try #require(world.spawn(radar))
+        var strike = ScUnitSpec()
+        (strike.vx, strike.kind, strike.affiliation) = (1, 3, SimWorld.affiliationFriendly)
+        strike.options = SimWorld.spawnPursuer
+        (strike.target_id, strike.outcome_class) = (target, 1)
+        (strike.speed_mps, strike.max_turn_rate_rad_s, strike.engagement_radius_m) = (100, 1, 10)
+        var bad = strike
+        bad.speed_mps = 0
+        #expect(world.spawn(bad) == nil)
+        #expect(world.spawn(strike) == 3)
+        #expect(world.addSensor(unit: 1))
+        #expect(!world.addSensor(unit: 99))
+
+        world.step(5)
+        #expect(world.status.hostile_detected == 1)
+        world.step(200)
+        #expect(world.status.unit_count == 1, "the strike removed the radar and itself")
+        let restored = try #require(SimWorld(snapshot: world.save()))
+        #expect(restored.linkDelay(unit: 1) == 3, "setup is saved with the world")
+    }
+}

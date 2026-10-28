@@ -1,7 +1,8 @@
-/* SimCore C API, header revision 1.2 (ABI version 1). Must match crates/abi/src/lib.rs byte for byte. */
+/* SimCore C API, header revision 1.3 (ABI version 1). Must match crates/abi/src/lib.rs byte for byte. */
 #ifndef SIMCORE_H
 #define SIMCORE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -34,8 +35,9 @@ static const uint8_t SC_FLAG_COMMAND_NODE = 1u << 1;
 /* The unit is currently detected by the opposing side's sensors. */
 static const uint8_t SC_FLAG_DETECTED = 1u << 2;
 
-/* One unit. Position and velocity are f32 metres relative to the player's
-   command node, local east-north-up (x east, y north, z up). 40 bytes. */
+/* One unit. Position is f32 metres relative to the player's command node; velocity is f32
+   m/s in the world frame (not relative to the node's motion). Local east-north-up (x east,
+   y north, z up). 40 bytes. */
 typedef struct ScUnitView {
     uint64_t id;
     float x, y, z;
@@ -102,6 +104,84 @@ typedef struct ScBytes {
     uint64_t len;
 } ScBytes;
 
+/* Revision 1.3: game setup. Every double below must be finite; distances, powers, rates and
+   chances must also be non-negative, and chances at most 1. Reserved fields must be zero. */
+
+/* Gameplay rules. The outcome table's entries are passed separately. 48 bytes. */
+typedef struct ScRules {
+    double detection_max_range_m;    /* cap on any detection range; 0 disables observation */
+    double sensor_base_range_m;      /* shared sensor parameters (see ScSensor) */
+    double sensor_reference_power_w;
+    double default_chance;           /* for (class, kind) pairs not in the table */
+    uint32_t exposure_threshold_ticks; /* detected at this exposure; 0 is treated as 1 */
+    uint32_t exposure_cap_ticks;
+    uint32_t exposure_decay_per_tick;
+    uint32_t _reserved;
+} ScRules;
+
+/* A pursuer of outcome_class engaging a target of target_kind succeeds with chance. 16 bytes. */
+typedef struct ScOutcome {
+    uint16_t outcome_class;
+    uint16_t target_kind;
+    uint32_t _reserved;
+    double chance;
+} ScOutcome;
+
+/* Link delay = base + ceil(per_km * km from the command node) + jam delay if an emitting
+   hostile jammer is within jam_radius_m, capped at max_delay_ticks. 32 bytes. */
+typedef struct ScLinkRules {
+    double delay_ticks_per_km;
+    double jam_radius_m;
+    uint32_t base_delay_ticks;
+    uint32_t jam_delay_ticks;
+    uint32_t max_delay_ticks;
+    uint32_t _reserved;
+} ScLinkRules;
+
+/* A heightfield of nx * ny samples spacing_m apart, row-major: sample (i, j) is at
+   (origin_x + i * spacing_m, origin_y + j * spacing_m), metres relative to the command node
+   when the call is made. 40 bytes. */
+typedef struct ScTerrain {
+    double origin_x, origin_y;
+    double spacing_m;      /* positive */
+    uint32_t nx, ny;       /* at least 1 each */
+    uint32_t los_samples;  /* per line-of-sight check, at most 1024 */
+    uint32_t _reserved;
+} ScTerrain;
+
+/* Spawn options (ScUnitSpec.options). */
+static const uint8_t SC_SPAWN_EMITTING = 1u << 0; /* radiates continuously; not with CYCLE */
+static const uint8_t SC_SPAWN_CYCLE = 1u << 1;    /* radiates on the cycle_* duty cycle */
+static const uint8_t SC_SPAWN_PURSUER = 1u << 2;  /* target_id, outcome_class, pursuit fields */
+static const uint8_t SC_SPAWN_SENSOR = 1u << 3;   /* passive sensor, shared rules parameters */
+
+/* One unit to spawn. Position is metres relative to the command node when the call is made;
+   velocity is m/s in the world frame, as in ScUnitView. A pursuer's velocity is only its initial heading. Fields an option does
+   not use are ignored. 112 bytes. */
+typedef struct ScUnitSpec {
+    double x, y, z;
+    double vx, vy, vz;
+    float erp_w;          /* radiated power while emitting, W */
+    uint16_t kind;        /* any type code except the command node's */
+    uint8_t affiliation;  /* SC_AFFILIATION_* */
+    uint8_t options;      /* SC_SPAWN_* */
+    uint32_t cycle_on_ticks, cycle_off_ticks, cycle_phase; /* CYCLE */
+    uint16_t outcome_class; /* PURSUER: outcome table row */
+    uint16_t _reserved;
+    uint64_t target_id;     /* PURSUER: an existing unit */
+    double speed_mps;       /* PURSUER: positive */
+    double max_turn_rate_rad_s; /* PURSUER */
+    double lead;            /* PURSUER: 0 (pure pursuit) to 1 */
+    double engagement_radius_m; /* PURSUER */
+} ScUnitSpec;
+
+/* Passive sensor: an emitter of reference_power_w is heard out to base_range_m, scaling with
+   the square root of power. 16 bytes. */
+typedef struct ScSensor {
+    double base_range_m;
+    double reference_power_w;
+} ScSensor;
+
 /* Opaque world handle. All calls on one handle must come from one thread at a time. */
 typedef struct ScWorld ScWorld;
 
@@ -150,6 +230,30 @@ ScBytes sc_world_save(ScWorld *world);
 /* A world restored from sc_world_save bytes. It continues exactly as the saved world would
    have. NULL if the bytes are not a snapshot this build reads, or are damaged. */
 ScWorld *SC_NULLABLE sc_world_restore(const uint8_t *SC_NULLABLE data, uint64_t len);
+
+/* Game setup (revision 1.3). Each call checks all its input and changes nothing if it returns
+   false or 0. They may be called at any time between steps, and are saved with the world. */
+
+/* Replaces the rules. `outcomes` may be NULL only when outcome_count is 0; each (class, kind)
+   pair may appear once. */
+bool sc_world_set_rules(ScWorld *world, const ScRules *rules,
+                        const ScOutcome *SC_NULLABLE outcomes, uint32_t outcome_count);
+
+/* Replaces the link-delay rules for commands issued from now on. */
+bool sc_world_set_link_rules(ScWorld *world, const ScLinkRules *rules);
+
+/* Replaces the terrain. NULL `terrain` means flat (everything in line of sight); otherwise
+   `heights` holds height_count == nx * ny finite heights in metres, copied. */
+bool sc_world_set_terrain(ScWorld *world, const ScTerrain *SC_NULLABLE terrain,
+                          const float *SC_NULLABLE heights, uint64_t height_count);
+
+/* Spawns a unit and returns its id (ids are never reused), or 0 if the spec is rejected or
+   ids up to 2^24 - 1 are used up. */
+uint64_t sc_world_spawn(ScWorld *world, const ScUnitSpec *spec);
+
+/* Makes a live unit (the command node included) a passive sensor, replacing any previous one.
+   NULL `sensor` uses the shared rules' parameters. False for an unknown unit or bad values. */
+bool sc_world_add_sensor(ScWorld *world, uint64_t unit_id, const ScSensor *SC_NULLABLE sensor);
 
 #if defined(__clang__)
 #pragma clang assume_nonnull end

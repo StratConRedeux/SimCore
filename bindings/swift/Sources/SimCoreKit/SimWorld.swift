@@ -157,6 +157,60 @@ extension SimWorld {
     }
 }
 
+// MARK: - Contract revision 1.3: game setup
+
+extension SimWorld {
+    public static let spawnEmitting: UInt8 = SC_SPAWN_EMITTING
+    public static let spawnCycle: UInt8 = SC_SPAWN_CYCLE
+    public static let spawnPursuer: UInt8 = SC_SPAWN_PURSUER
+    public static let spawnSensor: UInt8 = SC_SPAWN_SENSOR
+
+    /// Replaces the gameplay rules and outcome table. `false`, with nothing changed, if a value
+    /// is out of range or a (class, kind) pair repeats.
+    public func setRules(_ rules: ScRules, outcomes: [ScOutcome] = []) -> Bool {
+        precondition(!readingFrame, "SimWorld.setRules called inside withFrame")
+        var r = rules
+        return outcomes.withUnsafeBufferPointer { o in
+            sc_world_set_rules(handle, &r, o.baseAddress, UInt32(o.count))
+        }
+    }
+
+    /// Replaces the link-delay rules for commands issued from now on. `false`, with nothing
+    /// changed, if a value is out of range.
+    public func setLinkRules(_ rules: ScLinkRules) -> Bool {
+        precondition(!readingFrame, "SimWorld.setLinkRules called inside withFrame")
+        var r = rules
+        return sc_world_set_link_rules(handle, &r)
+    }
+
+    /// Replaces the terrain with a heightfield of `terrain.nx * terrain.ny` heights, or with
+    /// flat terrain when `terrain` is `nil`. `false`, with nothing changed, if it is invalid.
+    public func setTerrain(_ terrain: ScTerrain?, heights: [Float] = []) -> Bool {
+        precondition(!readingFrame, "SimWorld.setTerrain called inside withFrame")
+        guard var t = terrain else { return sc_world_set_terrain(handle, nil, nil, 0) }
+        return heights.withUnsafeBufferPointer { h in
+            sc_world_set_terrain(handle, &t, h.baseAddress, UInt64(h.count))
+        }
+    }
+
+    /// Spawns a unit, positioned relative to the command node, and returns its id; `nil` if
+    /// the engine rejects the spec.
+    public func spawn(_ spec: ScUnitSpec) -> UInt64? {
+        precondition(!readingFrame, "SimWorld.spawn called inside withFrame")
+        var s = spec
+        let id = sc_world_spawn(handle, &s)
+        return id == 0 ? nil : id
+    }
+
+    /// Makes a live unit a passive sensor, with its own parameters or, for `nil`, the shared
+    /// rules' ones. `false` for an unknown unit or invalid values.
+    public func addSensor(unit: UInt64, _ sensor: ScSensor? = nil) -> Bool {
+        precondition(!readingFrame, "SimWorld.addSensor called inside withFrame")
+        guard var p = sensor else { return sc_world_add_sensor(handle, unit, nil) }
+        return sc_world_add_sensor(handle, unit, &p)
+    }
+}
+
 /// Explicitly not Sendable: see the threading note on `SimWorld`.
 @available(*, unavailable)
 extension SimWorld: Sendable {}

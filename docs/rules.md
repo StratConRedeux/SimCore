@@ -328,6 +328,44 @@ hits are sorted by pursuer id, and heatmap emitters are sorted before summing.
 **Catching up after time away** is the caller's policy. The Swift binding offers
 `SimWorld.catchUp(elapsedTicks:maxTicks:)`, which runs at most `maxTicks`.
 
+## Game setup over the C API
+
+Everything above is caller data, and since header revision 1.3 the app can supply all of it
+through the C API (`SimWorld` in Swift):
+
+- `sc_world_set_rules`: `ScRules` plus the outcome table as `ScOutcome` entries.
+- `sc_world_set_link_rules`: `ScLinkRules`.
+- `sc_world_set_terrain`: `ScTerrain` plus `nx * ny` heights, or NULL for flat terrain.
+- `sc_world_spawn`: one `ScUnitSpec`. `SC_SPAWN_*` options make it radiate continuously or on a
+  duty cycle, a pursuer, or a sensor with the shared parameters.
+- `sc_world_add_sensor`: a sensor with its own parameters, on any live unit including the command
+  node.
+
+The C API is stricter than the Rust one, where the rules tolerate odd values (non-positive ranges
+switch things off, NaN chances count as 0). Every `f64` must be finite. Distances, powers,
+rates and chances must be non-negative, and chances at most 1. Reserved fields and unknown option
+bits must be zero. A rejected call changes nothing.
+
+`Sim::spawn` does the unit checks, and Rust callers can use it too. It rejects:
+- non-finite kinematics;
+- negative or non-finite power;
+- an unknown affiliation;
+- the command node's kind;
+- invalid pursuit values;
+- a pursuer whose target does not exist;
+- ids past `MAX_UNIT_ID` (`2^24 - 1`, the largest id a snapshot restores).
+
+So a world built through the C API can always be saved and restored. `Sim::spawn_unit` and
+`Sim::spawn_pursuer` stay unchecked.
+
+Positions in setup calls (unit positions, the terrain origin) are metres relative to the command
+node at the time of the call, the same frame as commands, and are converted to world coordinates
+at once. Velocities are world m/s, as in frames: a unit spawned at rest stays put even if the
+node is moving. Setup calls may come at any time between steps (a drone launch or a
+strike is a spawn mid-game), and everything they set is saved with the world. With a duty cycle,
+a new unit's emission state comes from the current tick. A pursuer's velocity only gives its
+initial heading.
+
 ## Floating origin
 
 `to_local_f32(world, origin) = (world - origin) as f32`. The subtraction is in `f64`, so frames are

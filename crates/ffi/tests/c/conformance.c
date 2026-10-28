@@ -29,6 +29,33 @@ _Static_assert(sizeof(ScStatus) == 48, "ScStatus size");
 _Static_assert(offsetof(ScStatus, unit_count) == 8, "unit_count");
 _Static_assert(offsetof(ScStatus, awaiting_cleanup) == 40, "awaiting_cleanup");
 _Static_assert(sizeof(ScBytes) == 16, "ScBytes size");
+_Static_assert(sizeof(ScRules) == 48, "ScRules size");
+_Static_assert(offsetof(ScRules, default_chance) == 24, "default_chance");
+_Static_assert(offsetof(ScRules, exposure_threshold_ticks) == 32, "exposure_threshold_ticks");
+_Static_assert(offsetof(ScRules, _reserved) == 44, "rules _reserved");
+_Static_assert(sizeof(ScOutcome) == 16, "ScOutcome size");
+_Static_assert(offsetof(ScOutcome, target_kind) == 2, "target_kind");
+_Static_assert(offsetof(ScOutcome, chance) == 8, "chance");
+_Static_assert(sizeof(ScLinkRules) == 32, "ScLinkRules size");
+_Static_assert(offsetof(ScLinkRules, base_delay_ticks) == 16, "base_delay_ticks");
+_Static_assert(offsetof(ScLinkRules, max_delay_ticks) == 24, "max_delay_ticks");
+_Static_assert(sizeof(ScTerrain) == 40, "ScTerrain size");
+_Static_assert(offsetof(ScTerrain, nx) == 24, "nx");
+_Static_assert(offsetof(ScTerrain, los_samples) == 32, "los_samples");
+_Static_assert(sizeof(ScUnitSpec) == 112, "ScUnitSpec size");
+_Static_assert(_Alignof(ScUnitSpec) == 8, "ScUnitSpec align");
+_Static_assert(offsetof(ScUnitSpec, vx) == 24, "spec vx");
+_Static_assert(offsetof(ScUnitSpec, erp_w) == 48, "erp_w");
+_Static_assert(offsetof(ScUnitSpec, kind) == 52, "spec kind");
+_Static_assert(offsetof(ScUnitSpec, affiliation) == 54, "spec affiliation");
+_Static_assert(offsetof(ScUnitSpec, options) == 55, "options");
+_Static_assert(offsetof(ScUnitSpec, cycle_on_ticks) == 56, "cycle_on_ticks");
+_Static_assert(offsetof(ScUnitSpec, cycle_phase) == 64, "cycle_phase");
+_Static_assert(offsetof(ScUnitSpec, outcome_class) == 68, "outcome_class");
+_Static_assert(offsetof(ScUnitSpec, target_id) == 72, "spec target_id");
+_Static_assert(offsetof(ScUnitSpec, speed_mps) == 80, "spec speed_mps");
+_Static_assert(offsetof(ScUnitSpec, engagement_radius_m) == 104, "engagement_radius_m");
+_Static_assert(sizeof(ScSensor) == 16, "ScSensor size");
 
 /* Every function, through a pointer of exactly the header's type. */
 static uint32_t (*const p_abi_version)(void) = sc_abi_version;
@@ -44,6 +71,13 @@ static ScStatus (*const p_status)(ScWorld *) = sc_world_status;
 static void (*const p_despawn_removed)(ScWorld *) = sc_world_despawn_removed;
 static ScBytes (*const p_save)(ScWorld *) = sc_world_save;
 static ScWorld *(*const p_restore)(const uint8_t *, uint64_t) = sc_world_restore;
+static bool (*const p_set_rules)(ScWorld *, const ScRules *, const ScOutcome *, uint32_t) =
+    sc_world_set_rules;
+static bool (*const p_set_link_rules)(ScWorld *, const ScLinkRules *) = sc_world_set_link_rules;
+static bool (*const p_set_terrain)(ScWorld *, const ScTerrain *, const float *, uint64_t) =
+    sc_world_set_terrain;
+static uint64_t (*const p_spawn)(ScWorld *, const ScUnitSpec *) = sc_world_spawn;
+static bool (*const p_add_sensor)(ScWorld *, uint64_t, const ScSensor *) = sc_world_add_sensor;
 
 static int failures = 0;
 #define CHECK(cond)                                                                \
@@ -200,6 +234,64 @@ int main(void) {
     p_despawn_removed(d);
     p_destroy(d);
     p_destroy(e);
+
+    /* Revision 1.3: NULL inputs. */
+    ScRules nr = {0};
+    ScLinkRules nl = {0};
+    ScUnitSpec nu = {0};
+    CHECK(!p_set_rules(NULL, &nr, NULL, 0));
+    CHECK(!p_set_link_rules(NULL, &nl));
+    CHECK(!p_set_terrain(NULL, NULL, NULL, 0));
+    CHECK(p_spawn(NULL, &nu) == 0);
+    CHECK(!p_add_sensor(NULL, 1, NULL));
+
+    /* A scenario built from C: rules, link rules, terrain, units, sensors. */
+    ScWorld *g = p_create(9);
+    ScRules rules = {.detection_max_range_m = 20000.0, .sensor_base_range_m = 2000.0,
+                     .sensor_reference_power_w = 1.0, .exposure_threshold_ticks = 2,
+                     .exposure_cap_ticks = 10, .exposure_decay_per_tick = 1};
+    ScOutcome table[2] = {{.outcome_class = 1, .target_kind = 4, .chance = 1.0},
+                          {.outcome_class = 1, .target_kind = 5, .chance = 0.25}};
+    CHECK(p_set_rules(g, &rules, NULL, 2) == false);
+    CHECK(p_set_rules(g, &rules, table, 2));
+    table[1].target_kind = 4; /* a repeated pair */
+    CHECK(!p_set_rules(g, &rules, table, 2));
+    ScLinkRules link = {.base_delay_ticks = 4, .max_delay_ticks = 30};
+    CHECK(p_set_link_rules(g, &link));
+    CHECK(p_link_delay(g, 1) == 4);
+    link.jam_radius_m = -1.0;
+    CHECK(!p_set_link_rules(g, &link));
+    float heights[6] = {0, 0, 0, 0, 0, 0};
+    ScTerrain terrain = {.spacing_m = 500.0, .nx = 3, .ny = 2, .los_samples = 16};
+    CHECK(p_set_terrain(g, &terrain, heights, 6));
+    CHECK(!p_set_terrain(g, &terrain, heights, 5));
+    CHECK(p_set_terrain(g, NULL, NULL, 0));
+
+    ScUnitSpec radar = {.x = 1000.0, .erp_w = 50000.0f, .kind = 4,
+                        .affiliation = SC_AFFILIATION_HOSTILE, .options = SC_SPAWN_EMITTING};
+    uint64_t radar_id = p_spawn(g, &radar);
+    CHECK(radar_id == 2);
+    ScUnitSpec bad_spec = radar;
+    bad_spec.options = SC_SPAWN_EMITTING | SC_SPAWN_CYCLE;
+    CHECK(p_spawn(g, &bad_spec) == 0);
+    CHECK(p_spawn(g, NULL) == 0);
+    ScUnitSpec strike = {.vx = 1.0, .erp_w = 1.0f, .kind = 3,
+                         .affiliation = SC_AFFILIATION_FRIENDLY, .options = SC_SPAWN_PURSUER,
+                         .outcome_class = 1, .target_id = radar_id, .speed_mps = 100.0,
+                         .max_turn_rate_rad_s = 1.0, .engagement_radius_m = 10.0};
+    CHECK(p_spawn(g, &strike) == 3);
+    CHECK(p_add_sensor(g, 1, NULL));
+    ScSensor own = {.base_range_m = 500.0, .reference_power_w = 1.0};
+    CHECK(p_add_sensor(g, 3, &own));
+    CHECK(!p_add_sensor(g, 99, &own));
+
+    /* The node hears the radar; the strike reaches it in about 10 s and both are removed. */
+    p_step(g, 5);
+    CHECK(p_status(g).hostile_detected == 1);
+    p_step(g, 200);
+    ScStatus sg = p_status(g);
+    CHECK(sg.unit_count == 1 && sg.awaiting_cleanup == 2);
+    p_destroy(g);
 
     if (failures) {
         fprintf(stderr, "conformance: %d failure(s)\n", failures);

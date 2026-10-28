@@ -52,6 +52,25 @@ pub mod kind {
     pub const JAMMER: u16 = 6;
 }
 
+/// The largest stable id a world can save and restore (`2^24 - 1`). [`Sim::spawn`] refuses to
+/// go past it.
+pub const MAX_UNIT_ID: u64 = (1 << 24) - 1;
+
+/// Why [`Sim::spawn`] rejected a unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpawnError {
+    /// A non-finite position or velocity, a negative or non-finite power, an unknown
+    /// affiliation, or the command node's kind.
+    InvalidUnit,
+    /// A pursuer speed that is not positive and finite, a negative or non-finite turn rate or
+    /// engagement radius, or a lead outside `[0, 1]`.
+    InvalidPursuer,
+    /// The pursuer's target does not exist.
+    UnknownTarget,
+    /// Every id up to [`MAX_UNIT_ID`] has been used.
+    IdsExhausted,
+}
+
 /// Simulation time, in ticks since creation.
 #[derive(Resource, Clone, Copy, Debug, Default)]
 pub struct SimClock {
@@ -271,6 +290,55 @@ impl Sim {
         self.spawn_with(spec, pursuer)
     }
 
+    /// Spawns a unit, or a pursuer, after checking it, and returns its stable id.
+    ///
+    /// Unlike [`Sim::spawn_unit`] and [`Sim::spawn_pursuer`], this rejects values the rules
+    /// would only tolerate (see [`SpawnError`]), a pursuer whose target does not exist, and ids
+    /// beyond [`MAX_UNIT_ID`], so every world built with it can be saved and restored. With a
+    /// duty cycle, `spec.ems.emitting` is ignored: the cycle decides, from the current tick.
+    pub fn spawn(
+        &mut self,
+        mut spec: UnitSpec,
+        pursuer: Option<Pursuer>,
+    ) -> Result<StableId, SpawnError> {
+        let finite = |v: [f64; 3]| v.iter().all(|c| c.is_finite());
+        let p = spec.position;
+        let v = spec.velocity;
+        let unit_ok = finite([p.x, p.y, p.z])
+            && finite([v.x, v.y, v.z])
+            && spec.ems.erp_w >= 0.0
+            && spec.ems.erp_w.is_finite()
+            && spec.affiliation <= affiliation::NEUTRAL
+            && spec.kind != kind::COMMAND_NODE;
+        if !unit_ok {
+            return Err(SpawnError::InvalidUnit);
+        }
+        if let Some(cycle) = spec.cycle {
+            spec.ems.emitting = cycle.is_on(self.tick());
+        }
+        if let Some(q) = pursuer {
+            let non_negative = |x: f64| x >= 0.0 && x.is_finite();
+            let ok = q.speed > 0.0
+                && q.speed.is_finite()
+                && non_negative(q.max_turn_rate)
+                && non_negative(q.engagement_radius_m)
+                && (0.0..=1.0).contains(&q.lead);
+            if !ok {
+                return Err(SpawnError::InvalidPursuer);
+            }
+            if !self.contains(q.target) {
+                return Err(SpawnError::UnknownTarget);
+            }
+        }
+        if self.next_id > MAX_UNIT_ID {
+            return Err(SpawnError::IdsExhausted);
+        }
+        Ok(match pursuer {
+            Some(q) => self.spawn_pursuer(spec, q),
+            None => self.spawn_unit(spec),
+        })
+    }
+
     /// Despawns the entities of units removed by engagements, releasing their storage.
     ///
     /// Removed units leave the id index, the frame and the heatmap at once; their entities
@@ -306,7 +374,8 @@ impl Sim {
     }
 
     /// Makes unit `id` a passive sensor (replacing any previous one). Returns `false` if the
-    /// unit does not exist.
+    /// unit does not exist. Parameters are taken as given: see
+    /// [`simcore_rules::detection_range`] for how non-positive values behave.
     pub fn add_sensor(&mut self, id: StableId, sensor: Sensor) -> bool {
         let Some(e) = self.entity(id) else {
             return false;
@@ -594,5 +663,52 @@ fn integrate_movement(mut q: Query<(&mut Position, &Velocity)>) {
         pos.x += vel.x * DT;
         pos.y += vel.y * DT;
         pos.z += vel.z * DT;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quad() -> UnitSpec {
+        UnitSpec {
+            kind: kind::QUADCOPTER,
+            affiliation: affiliation::FRIENDLY,
+            position: Position::default(),
+            velocity: Velocity::default(),
+            ems: EmsProfile::default(),
+            cycle: None,
+        }
+    }
+
+    #[test]
+    fn spawn_stops_at_the_largest_restorable_id() {
+        let mut sim = Sim::new(1);
+        sim.next_id = MAX_UNIT_ID;
+        assert_eq!(sim.spawn(quad(), None), Ok(StableId(MAX_UNIT_ID)));
+        assert_eq!(sim.spawn(quad(), None), Err(SpawnError::IdsExhausted));
+        assert_eq!(sim.unit_count(), 2);
+        // The fullest world it allows still round-trips.
+        let saved = sim.save().to_vec();
+        let restored = Sim::restore(&saved).expect("restores");
+        assert!(restored.contains(StableId(MAX_UNIT_ID)));
+    }
+
+    #[test]
+    fn a_duty_cycle_sets_emitting_from_the_current_tick() {
+        let mut sim = Sim::new(1);
+        sim.step(3);
+        let cycle = EmitterCycle {
+            on_ticks: 2,
+            off_ticks: 2,
+            phase: 0,
+        };
+        let mut spec = quad();
+        spec.ems.emitting = true;
+        spec.cycle = Some(cycle);
+        // Tick 3 of an on-2, off-2 cycle is off.
+        let id = sim.spawn(spec, None).unwrap();
+        let e = sim.entity(id).unwrap();
+        assert!(!sim.world().get::<EmsProfile>(e).unwrap().emitting);
     }
 }
