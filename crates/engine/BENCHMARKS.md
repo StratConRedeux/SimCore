@@ -37,8 +37,14 @@ targets. Max detection range is 8 km. All values are dummies.
 | `step(1)` p99 | ~1.85 ms (max ~1.9 ms) |
 | Engagements during the 300 measured ticks | 104 (in 29 of the ticks) |
 | Heap allocations in 300 x (`step(1)` + `frame()`) | 0 (asserted by the bench) |
-| Heatmap build, 128 x 128 (500 m cells, 8 km cutoff, ~4,900 emitters) | ~3.49 ms median, ~3.64 ms p99 |
-| Heap allocations in 50 heatmap builds | 0 (asserted) |
+| Heatmap build, 128 x 128 (500 m cells, 8 km cutoff, ~4,900 emitters), exact | ~3.50 ms median, ~3.61 ms p99 |
+| Same, far field (`theta = 2`) | ~3.89 ms median, ~4.12 ms p99 (worst cell 0.08% off) |
+| Heap allocations in 50 exact + 50 far-field heatmap builds | 0 (asserted) |
+
+In this spread-out scenario the cutoff (8 km) is only twice a block's width, so most grid cells
+within it are either not far enough to aggregate or straddle a block's cutoff circle (and are
+summed emitter by emitter, so the cutoff stays exact). Little gets aggregated, and the far field
+is ~11% slower than exact: use `HeatmapSpec::EXACT` when the cutoff is only a few block widths.
 
 **Allocations.** The engine's own buffers are reused. The grids reserve their worst-case size up
 front, and the engagement buffers are sized for the live pursuers when a pursuer is spawned.
@@ -59,8 +65,10 @@ Layouts outside the main scenario, chosen to hit the cost bounds in `docs/rules.
 | 2 km cluster, 1,000 x 10,000, blocked | ~49 ms (flat: ~0.12 ms) |
 | 2 km cluster, 2,000 x 20,000, blocked | ~197 ms (flat: ~0.23 ms) |
 | Rules scenario plus one sensor per side at (1e7, 1e7) m | ~2.0 ms (without: ~1.67 ms) |
-| Heatmap 128 x 128, 50 m cells, 8 km cutoff, 20,000 emitters in a 2 km disc | ~194 ms |
-| Heatmap 512 x 512, same emitters | ~1,061 ms |
+| Heatmap 128 x 128, 50 m cells, 8 km cutoff, 20,000 emitters in a 2 km disc, exact | ~194 ms |
+| Same, far field (`theta = 2`) | ~6.3 ms (worst cell 0.05% off; 0.021% of the max) |
+| Heatmap 512 x 512, same emitters, exact | ~1,064 ms |
+| Same, far field (`theta = 2`) | ~140 ms (worst cell 0.05% off; the cutoff circle of a third of the blocks crosses the cluster) |
 
 **Cost.** Observation dominates the step: grid queries over the opposing side's sensors, an exact
 range test per candidate, and up to 16 bilinear terrain samples per in-range pair. Each emitter
@@ -73,9 +81,15 @@ The grid's cell size is fixed at half the max range. A far outlier switches it t
 (binary search per row) instead of coarsening the cells, which costs ~20% here rather than
 putting every sensor in one cell.
 
-The heatmap costs about cells x emitters within the cutoff (plus a block's half-diagonal), with no
-cap: clustered emitters near the map make every cell expensive. It is built on demand, not every
-tick.
+The exact heatmap costs about cells x emitters within the cutoff (plus a block's half-diagonal),
+with no cap: clustered emitters near the map make every cell expensive. The far field
+(`HeatmapSpec::theta`, see `docs/rules.md`) replaces each distant grid cell of emitters with its
+aggregate (with a quadrupole term), so a block of cells costs about the tree cells it visits
+plus the emitters of the leaves that are near it or straddle its cutoff circle: 31x faster on the
+128 x 128 cluster. On the 512 x 512 the cutoff circle of many blocks crosses the cluster, and
+those emitters are summed one by one to keep the cutoff exact, so it is only 7.6x faster. The
+error stays within ~1.3% of each cell at `theta = 2`, including at the cutoff. Exact mode is unchanged (bit for bit, tested). Either way the heatmap is
+built on demand, not every tick.
 
 Medians over 300 iterations after one warm-up step and frame, with hot caches. Memory comes from
 a counting global allocator in the example, so it is exact heap bytes, not RSS. The ECS figure

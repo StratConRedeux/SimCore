@@ -137,16 +137,21 @@ from the outcome table for `(outcome_class, target kind)`.
 
 - Success removes the target, except the **command node, which is never removed**: a pursuer
   may target it (a hostile drone aimed at the player's node is an ordinary scenario), and a
-  successful roll is reported, but the node stays. The pursuer is removed either way.
+  successful roll is reported as a **command-node hit**, but the node stays. The pursuer is
+  removed either way.
 - Hits are gathered and resolved in ECS query order, which is deterministic. A hit is skipped if
   an earlier hit this tick already removed its pursuer or target.
 - Rolls use the Sim's PCG32, seeded from `Sim::new(seed)` on its own stream, so the same seed and
   inputs give the same outcomes.
 - Each resolution is recorded as an
-  `EngagementEvent { tick, pursuer, target, success, target_removed }`. `success` is the roll;
-  `target_removed` is `success` unless the target is the command node.
+  `EngagementEvent { tick, pursuer, target, success, target_removed, command_node_hit }`.
+  `success` is the roll; `command_node_hit` is `success` against the command node, and
+  `target_removed` is `success` against anything else, so at most one of them is set.
   `Sim::engagement_events()` returns the events from the most recent `step` call, in resolution
   order, from a buffer that is reused.
+- `Sim::command_node_hits()` is the running total of command-node hits since `Sim::new`
+  (saturating at `u32::MAX`), a field read. The engine attaches no consequence to it: what a hit
+  means (damage, a lost game) is for the caller's rules.
 
 **Outcome table** (`Rules::outcomes`, `OutcomeTable`): a sorted list of
 `(class, kind) -> chance` with a `default_chance` for missing pairs. Chances are clamped to
@@ -177,18 +182,77 @@ command node. Each cell sums `signal_strength` over currently emitting units of 
 whose **horizontal** distance from the cell centre is within `cutoff_m`. The heatmap is Rust-only
 for now; it is not in the FFI contract.
 
+`HeatmapSpec::theta` picks between the exact sum and a far-field approximation. `theta =
+f64::INFINITY` (`HeatmapSpec::EXACT`) is exact; any finite value (suggested:
+`HeatmapSpec::DEFAULT_THETA = 2.0`; below 1 counts as 1) approximates. NaN is also summed
+exactly, but it is not a supported value: when `HeatmapSpec` goes into the FFI, `INFINITY` stays
+the one encoding of exact (or an explicit mode replaces it), and NaN may become invalid.
+
+**Exact** (unchanged from before `theta` existed, bit for bit):
+
 - Emitters go into the same kind of uniform grid (cells of half the cutoff). Each 8 x 8 block of
   cells gathers its candidates once, then sums them with four fixed partial sums per cell, so the
   result is deterministic.
+- **Cost bound:** about `cells x emitters within (cutoff + 5.7 cell widths)` pair evaluations
+  (the extra is the half-diagonal of a block), with no cap other than `MAX_CELLS` and the
+  caller's cutoff. Spread-out emitters are cheap; clustered ones are not. In the benchmark,
+  20,000 emitters packed in a 2 km disc with an 8 km cutoff take ~194 ms for 128 x 128 cells and
+  ~1.06 s for 512 x 512.
+
+**Far field** (finite `theta`):
+
+- The emitters go into a quadtree of square grid cells over their bounding box, sorted by Morton
+  code (no hashing; ties broken by index). Each grid cell keeps an aggregate: summed power, the
+  power-weighted centroid `(x, y)`, the power-weighted second moments about the centroid
+  (`Qxx`, `Qxy`, `Qyy`) and a radius `r` that no emitter of the cell is farther than from the
+  centroid. A cell with at most 4 emitters, or at the finest of 24 levels, is a leaf; a cell
+  whose emitters all fall in one child is not stored, so there are fewer than `2n` cells.
+- Each 8 x 8 block of map cells walks the tree once, depth first. A grid cell is **far** when
+  the distance from the block's box of cell centres to its emitter disc (the centroid's distance
+  minus `r`) is positive, at least `d_min` and at least `theta * 2r`, and the disc is wholly
+  within the cutoff of every centre in the box (the farthest distance to the centroid plus `r`
+  is at most the cutoff). It then counts as one source and its children are skipped. A grid cell
+  whose nearest point is beyond the cutoff is skipped. Otherwise its children are visited, and a
+  leaf that is not far adds its emitters exactly. The test uses the whole block, so every map
+  cell meets it, and some near cells that a per-cell test would approximate stay exact.
+- Emitters are summed per map cell exactly as in the exact mode, cutoff test included. A far
+  grid cell adds `P / d^2 - (Qxx + Qyy) / d^4 + 4 (dx^2 Qxx + 2 dx dy Qxy + dy^2 Qyy) / d^6`,
+  with `d = (dx, dy)` from the map cell centre to its centroid: the expansion of the exact sum to
+  second order (the first-order term is zero about the centroid). Since no far cell straddles
+  the cutoff circle, or comes within `d_min` of a centre, neither the cutoff nor `d_min` changes
+  its terms.
+- **Error.** The only error is the truncated expansion. Each far cell is off by at most a fixed
+  fraction of its own exact contribution, set by `theta` alone (the centroid is at least
+  `(2 theta + 1) r` away), so a map cell is off by at most that fraction of its exact value. A
+  random search over layouts of 2 to 4 emitters puts that fraction at about 7% for `theta = 1`,
+  1.3% for `theta = 2` and 0.2% for `theta = 4`. In the tested layouts (clustered, spread,
+  mixed, a pair of emitters on a grid cell's diagonal, and a block of emitters straddling the
+  cutoff), the worst cell at `theta = 2` is 0.67% off its exact value (the pair; 0.08% for the
+  others), 2.0% at `theta = 1` and 0.03% at `theta = 4`. The tests assert, at `theta >= 2`,
+  that every cell is within 5% of its exact value (and so within the larger of 5% of the cell
+  and 1% of the map's maximum).
+- **Cost bound:** per 8 x 8 block, the grid cells visited (a few dozen per tree level, growing
+  with `theta^2`) plus the emitters of the leaves that are not far, then `64 x` that many pair
+  evaluations, plus an `O(n log n)` sort per build. Those leaves include every leaf in a band
+  around the block's cutoff circle about 10 cell widths (the diagonal of the block's centres)
+  plus a leaf wide, since a grid cell is only aggregated when it is wholly inside the cutoff of
+  every centre. So the cost does not grow with `cells x
+  emitters` while the emitters are well inside the cutoff (the 128 x 128 clustered benchmark
+  takes ~6.3 ms), but it does grow with `cells x emitters near the cutoff circle`: at 512 x 512
+  the circle of a third of the blocks crosses the cluster, and the build takes ~140 ms (exact:
+  ~1.06 s). When the cutoff is only a few block widths, little gets aggregated and the far field
+  can be about 10% slower than exact (the 500 m benchmark); use `EXACT` there.
+- Deterministic: a fixed sort, traversal and summation order, and the same inputs give the same
+  bits. Exact and far-field results differ, so callers should not mix them in one comparison.
+
+Both modes:
+
 - An invalid spec gives an empty map: a non-positive or non-finite cell size or cutoff, no cells,
   or more than `HeatmapSpec::MAX_CELLS` (4096 x 4096).
 - All buffers are reused. Rebuilding does not allocate once the emitter count and spec are
-  stable.
-- **Cost bound:** about `cells x emitters within (cutoff + 5.7 cell widths)` pair evaluations
-  (the extra is the half-diagonal of a block), with no cap other than `MAX_CELLS` and the caller's cutoff. Spread-out emitters
-  are cheap; clustered ones are not. In the benchmark, 20,000 emitters packed in a 2 km disc with
-  an 8 km cutoff take ~195 ms for 128 x 128 cells and ~1.06 s for 512 x 512. Size the cutoff and
-  the grid for the expected emitter density, and build on demand rather than every tick.
+  stable (tested with a counting allocator in both modes).
+- Size the cutoff and the grid for the expected emitter density, and build on demand rather
+  than every tick.
 
 ## Floating origin
 

@@ -228,7 +228,8 @@ impl Sim {
     ///
     /// The target need not exist; a pursuer without a live target flies straight. Any unit can
     /// be targeted, but the command node is never removed: a successful engagement against it
-    /// consumes the pursuer and reports `target_removed: false`.
+    /// consumes the pursuer, reports `command_node_hit: true` and `target_removed: false`, and
+    /// counts in [`Sim::command_node_hits`].
     pub fn spawn_pursuer(&mut self, spec: UnitSpec, pursuer: Pursuer) -> StableId {
         // Each pursuer engages at most once: size the engagement buffers now, not mid-tick.
         self.engagements.add_pursuer(&mut self.world);
@@ -325,6 +326,12 @@ impl Sim {
     /// The buffer is reused across calls.
     pub fn engagement_events(&self) -> &[EngagementEvent] {
         &self.engagements.events
+    }
+
+    /// Successful engagements against the command node since creation, saturating at
+    /// `u32::MAX`. The engine only counts them; the caller's rules decide what they mean.
+    pub fn command_node_hits(&self) -> u32 {
+        self.engagements.command_node_hits
     }
 
     /// Rebuilds the signal heatmap around the command node from currently emitting units of

@@ -82,7 +82,9 @@ fn pursuer_behind_slower_target_closes_and_engages() {
     let entities = [sim.entity(target).unwrap(), sim.entity(m).unwrap()];
     // Closing at 30 m/s from 1,000 m: about 33 s.
     let (tick, success) = run_until_engaged(&mut sim, 40 * 15).expect("engages");
-    assert!(success && sim.engagement_events()[0].target_removed);
+    let e = sim.engagement_events()[0];
+    assert!(success && e.target_removed && !e.command_node_hit);
+    assert_eq!(sim.command_node_hits(), 0);
     assert!((480..=520).contains(&tick), "engaged at tick {tick}");
     assert!(!sim.contains(target) && !sim.contains(m));
     assert_eq!(sim.unit_count(), 1);
@@ -106,26 +108,57 @@ fn command_node_is_never_removed() {
         unit(HOSTILE, p(100.0, 0.0, 0.0), v(0.0, 0.0, 0.0), 0.0),
         pursuer(cmd, 50.0, 1.0, 0.0, 5.0),
     );
+    assert_eq!(sim.command_node_hits(), 0);
     let (_, success) = run_until_engaged(&mut sim, 60).expect("engages");
+    // Exactly one event, and it is a command-node hit.
+    assert_eq!(sim.engagement_events().len(), 1);
     let e = sim.engagement_events()[0];
-    assert!(success && !e.target_removed);
+    assert!(success && e.command_node_hit && !e.target_removed);
     assert_eq!((e.pursuer, e.target), (m, cmd));
+    assert_eq!(sim.command_node_hits(), 1);
     assert!(sim.contains(cmd) && !sim.contains(m));
     assert_eq!(sim.unit_count(), 1);
+    // The count is a running total: it outlives the step's events.
+    sim.step(30);
+    assert!(sim.engagement_events().is_empty());
+    assert_eq!(sim.command_node_hits(), 1);
     // Everything that reads the command node keeps working.
     sim.set_command_node_position(p(10.0, 0.0, 0.0));
     let frame = sim.frame();
     assert_eq!(frame.len(), 1);
     assert_eq!((frame[0].id, frame[0].x), (1, 0.0));
-    let spec = HeatmapSpec {
-        cell_size_m: 100.0,
-        cells_x: 8,
-        cells_y: 8,
-        d_min_m: 1.0,
-        cutoff_m: 1000.0,
-    };
-    let map = sim.build_heatmap(spec, HOSTILE);
-    assert_eq!((map.values().len(), map.origin().x), (64, 10.0));
+    assert_ne!(frame[0].flags & flags::COMMAND_NODE, 0);
+    for theta in [HeatmapSpec::EXACT, HeatmapSpec::DEFAULT_THETA] {
+        let spec = HeatmapSpec {
+            cell_size_m: 100.0,
+            cells_x: 8,
+            cells_y: 8,
+            d_min_m: 1.0,
+            cutoff_m: 1000.0,
+            theta,
+        };
+        let map = sim.build_heatmap(spec, HOSTILE);
+        assert_eq!((map.values().len(), map.origin().x), (64, 10.0));
+    }
+
+    // A second pursuer counts again; a failed roll does not.
+    let m2 = sim.spawn_pursuer(
+        unit(HOSTILE, p(110.0, 0.0, 0.0), v(0.0, 0.0, 0.0), 0.0),
+        pursuer(cmd, 50.0, 1.0, 0.0, 5.0),
+    );
+    run_until_engaged(&mut sim, 60).expect("engages");
+    assert_eq!(sim.command_node_hits(), 2);
+    assert!(sim.contains(cmd) && !sim.contains(m2));
+    sim.set_rules(rules(0.0, 0.0));
+    sim.spawn_pursuer(
+        unit(HOSTILE, p(110.0, 0.0, 0.0), v(0.0, 0.0, 0.0), 0.0),
+        pursuer(cmd, 50.0, 1.0, 0.0, 5.0),
+    );
+    let (_, success) = run_until_engaged(&mut sim, 60).expect("engages");
+    let e = sim.engagement_events()[0];
+    assert!(!success && !e.command_node_hit && !e.target_removed);
+    assert_eq!(sim.command_node_hits(), 2);
+    assert_eq!(sim.frame().len(), 1);
 }
 
 /// A target crossing 300 m ahead of a pursuer heading north at 100 m/s.
@@ -627,6 +660,7 @@ fn extreme_coordinates_do_not_panic() {
         cells_y: 1,
         d_min_m: 1.0,
         cutoff_m: 1e-12,
+        theta: HeatmapSpec::EXACT,
     };
     assert_eq!(sim.build_heatmap(spec, HOSTILE).values().len(), 4096);
 }
@@ -780,6 +814,7 @@ fn heatmap_inverse_square_and_empty() {
         cells_y: 64,
         d_min_m: 1.0,
         cutoff_m: 100_000.0,
+        theta: HeatmapSpec::EXACT,
     };
     // Nothing emits yet (a silent hostile and an emitting friendly).
     sim.spawn_unit(unit(

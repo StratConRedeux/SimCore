@@ -267,21 +267,62 @@ fn bench_worst_cases(units: u32) {
             cells_y: n,
             d_min_m: 10.0,
             cutoff_m: 8_000.0,
+            theta: HeatmapSpec::EXACT,
         };
-        sim.build_heatmap(spec, HOSTILE);
-        let ms: Vec<f64> = (0..5)
-            .map(|_| {
-                let t = Instant::now();
-                std::hint::black_box(sim.build_heatmap(spec, HOSTILE));
-                t.elapsed().as_secs_f64() * 1e3
-            })
-            .collect();
+        let far = HeatmapSpec {
+            theta: HeatmapSpec::DEFAULT_THETA,
+            ..spec
+        };
+        let ((exact, _), (approx, _)) = (
+            time_heatmap(&mut sim, spec, 5),
+            time_heatmap(&mut sim, far, 5),
+        );
+        let (rel, of_max) = heatmap_error(&mut sim, far);
         println!(
             "  heatmap {n}x{n} ({cell} m cells, 8 km cutoff) over 20,000 clustered emitters: \
-             {:.3} ms",
-            median(ms)
+             exact {:.3} ms, theta {} {:.3} ms (worst error {:.2}% of a cell, {:.3}% of the max)",
+            median(exact),
+            far.theta,
+            median(approx),
+            rel * 100.0,
+            of_max * 100.0
         );
     }
+}
+
+/// Times `iters` heatmap builds after one warm-up build. Returns the times in ms and the heap
+/// allocations made by the builds.
+fn time_heatmap(sim: &mut Sim, spec: HeatmapSpec, iters: usize) -> (Vec<f64>, usize) {
+    sim.build_heatmap(spec, HOSTILE);
+    let mut ms = Vec::with_capacity(iters);
+    let before = ALLOCS.load(Relaxed);
+    for _ in 0..iters {
+        let t = Instant::now();
+        std::hint::black_box(sim.build_heatmap(spec, HOSTILE));
+        ms.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    (ms, ALLOCS.load(Relaxed) - before)
+}
+
+/// Worst error of `spec` against the exact map: relative to the cell's exact value (over cells
+/// above 1e-6 of the max), and relative to the map's max.
+fn heatmap_error(sim: &mut Sim, spec: HeatmapSpec) -> (f64, f64) {
+    let exact = HeatmapSpec {
+        theta: HeatmapSpec::EXACT,
+        ..spec
+    };
+    let exact: Vec<f32> = sim.build_heatmap(exact, HOSTILE).values().to_vec();
+    let approx = sim.build_heatmap(spec, HOSTILE).values();
+    let max = f64::from(exact.iter().copied().fold(0.0, f32::max));
+    let (mut rel, mut of_max) = (0.0f64, 0.0f64);
+    for (&e, &a) in exact.iter().zip(approx) {
+        let err = f64::from((a - e).abs());
+        if f64::from(e) > 1e-6 * max {
+            rel = rel.max(err / f64::from(e));
+        }
+        of_max = of_max.max(err / max);
+    }
+    (rel, of_max)
 }
 
 fn bench_rules(units: u32) {
@@ -295,8 +336,14 @@ fn bench_rules(units: u32) {
         cells_y: 128,
         d_min_m: 10.0,
         cutoff_m: 8_000.0,
+        theta: HeatmapSpec::EXACT,
+    };
+    let far = HeatmapSpec {
+        theta: HeatmapSpec::DEFAULT_THETA,
+        ..spec
     };
     sim.build_heatmap(spec, HOSTILE);
+    sim.build_heatmap(far, HOSTILE);
 
     let mut step_ms = Vec::with_capacity(ITERS);
     let mut engagements = 0;
@@ -316,14 +363,10 @@ fn bench_rules(units: u32) {
     }
     let steady_allocs = ALLOCS.load(Relaxed) - allocs_before;
 
-    let mut heat_ms = Vec::with_capacity(50);
-    let allocs_before = ALLOCS.load(Relaxed);
-    for _ in 0..50 {
-        let t = Instant::now();
-        std::hint::black_box(sim.build_heatmap(spec, HOSTILE));
-        heat_ms.push(t.elapsed().as_secs_f64() * 1e3);
-    }
-    let heat_allocs = ALLOCS.load(Relaxed) - allocs_before;
+    let (heat_ms, exact_allocs) = time_heatmap(&mut sim, spec, 50);
+    let (far_ms, far_allocs) = time_heatmap(&mut sim, far, 50);
+    let heat_allocs = exact_allocs + far_allocs;
+    let (rel, of_max) = heatmap_error(&mut sim, far);
 
     let frame = sim.frame();
     let emitting = frame
@@ -352,10 +395,16 @@ fn bench_rules(units: u32) {
          ({quiet_allocs} in the {quiet_ticks} ticks without engagements)"
     );
     println!(
-        "heatmap 128x128 (500 m cells, 8 km cutoff): median {:.3} ms  p99 {:.3} ms; \
-         allocations in 50 builds: {heat_allocs}",
+        "heatmap 128x128 (500 m cells, 8 km cutoff): exact median {:.3} ms  p99 {:.3} ms; \
+         theta {} median {:.3} ms  p99 {:.3} ms (worst error {:.2}% of a cell, {:.3}% of the \
+         max); allocations in 2 x 50 builds: {heat_allocs}",
         median(heat_ms.clone()),
-        p99(heat_ms)
+        p99(heat_ms),
+        far.theta,
+        median(far_ms.clone()),
+        p99(far_ms),
+        rel * 100.0,
+        of_max * 100.0
     );
     assert_eq!(steady_allocs, 0, "steady-state ticks allocate");
     assert_eq!(heat_allocs, 0, "heatmap rebuilds allocate");
