@@ -24,6 +24,8 @@ pub mod flags {
     pub const EMITTING: u8 = 1 << 0;
     /// The unit is the player's command node, which is the frame's origin.
     pub const COMMAND_NODE: u8 = 1 << 1;
+    /// The unit is currently detected by the opposing side's sensors.
+    pub const DETECTED: u8 = 1 << 2;
 }
 
 /// One unit as the frontend sees it.
