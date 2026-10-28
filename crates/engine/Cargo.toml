@@ -1,0 +1,10 @@
+[package]
+name = "simcore-engine"
+description = "Headless deterministic ECS simulation engine."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+simcore-abi = { path = "../abi" }
+bevy_ecs = { version = "0.20.0", default-features = false, features = ["std"] }

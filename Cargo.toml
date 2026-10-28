@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/abi"]
+members = ["crates/abi", "crates/engine"]
 # Phase 1 adds: "crates/engine" (Agent 1), "crates/ffi" (Agent 4).
 
 [workspace.package]
