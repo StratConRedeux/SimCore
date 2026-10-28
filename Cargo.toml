@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["crates/abi"]
+# Phase 1 adds: "crates/engine" (Agent 1), "crates/ffi" (Agent 4).
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

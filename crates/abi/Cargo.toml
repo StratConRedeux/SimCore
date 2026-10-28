@@ -1,0 +1,8 @@
+[package]
+name = "simcore-abi"
+description = "Plain-data types shared across the C boundary. No logic."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
