@@ -1,0 +1,8 @@
+[package]
+name = "simcore-rules"
+description = "Pure, deterministic gameplay rule helpers for SimCore (steering, sweeps, detection, falloff)."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]

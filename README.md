@@ -4,10 +4,12 @@ A deterministic, data-oriented simulation engine in Rust (`bevy_ecs`), with a C 
 
 - `crates/abi`: plain-data types shared across the C boundary.
 - `crates/engine`: the fixed-tick ECS simulation.
+- `crates/rules`: pure, deterministic gameplay maths (steering, sweeps, detection, falloff, floating origin).
 - `crates/ffi`: the C API (`include/simcore.h`).
 - `bindings/swift`: `SimCoreKit`, a Swift package wrapping the XCFramework built by `scripts/build-xcframework.sh` (local development).
 - `Package.swift`: the same `SimCoreKit` for SwiftPM consumers, with the XCFramework from the tag's GitHub Release.
 - `docs/ffi-contract.md`: the rules for the boundary.
+- `docs/rules.md`: the gameplay rules, their inputs, units and limits.
 - `docs/releasing.md`: how releases are cut (`scripts/release.sh`).
 
 Releases are tagged with semantic versions. Consumers should pin to a tag, not a branch:
