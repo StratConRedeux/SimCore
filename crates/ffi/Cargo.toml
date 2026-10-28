@@ -1,0 +1,14 @@
+[package]
+name = "simcore-ffi"
+description = "C API for SimCore (include/simcore.h). Built as a staticlib for the iOS app."
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "simcore_ffi"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+simcore-abi = { path = "../abi" }
+simcore-engine = { path = "../engine" }
