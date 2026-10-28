@@ -1,0 +1,45 @@
+name: Swift bindings
+
+on:
+  push:
+    paths:
+      - "crates/**"
+      - "include/**"
+      - "scripts/**"
+      - "bindings/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/swift.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "include/**"
+      - "scripts/**"
+      - "bindings/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/swift.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # iOS 27 SDK needed; xcode-27 is a GitHub preview image.
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim aarch64-apple-darwin
+          swift --version
+      - name: Build XCFramework
+        run: scripts/build-xcframework.sh
+      - name: Swift tests (macOS)
+        working-directory: bindings/swift
+        run: swift test
+      - name: Build tests for iOS
+        working-directory: bindings/swift
+        run: xcodebuild build-for-testing -scheme SimCoreKit-Package -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO -quiet

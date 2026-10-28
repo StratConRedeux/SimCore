@@ -1,0 +1,43 @@
+name: Rust
+
+on:
+  push:
+    paths:
+      - "crates/**"
+      - "include/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "include/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # macOS because the C conformance test uses Apple's nm and clang.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustc --version
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Build for iOS
+        run: |
+          cargo build --release -p simcore-ffi --target aarch64-apple-ios
+          cargo build --release -p simcore-ffi --target aarch64-apple-ios-sim
