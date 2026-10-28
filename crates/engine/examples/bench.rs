@@ -463,6 +463,29 @@ fn main() {
     );
     println!("heap allocations during {ITERS} x (step(1) + frame()): {steady_allocs}");
 
+    // Save and restore of the rules scenario (sensors, pursuers, terrain): the app saves
+    // regularly during play, so this has to stay well under a frame budget's worth of time.
+    let mut sim = rules_scenario(units);
+    sim.step(30);
+    let (mut save_ms, mut restore_ms) = (Vec::new(), Vec::new());
+    let mut bytes = Vec::new();
+    for _ in 0..20 {
+        let t = Instant::now();
+        bytes = sim.save().to_vec();
+        save_ms.push(t.elapsed().as_secs_f64() * 1e3);
+        let t = Instant::now();
+        std::hint::black_box(Sim::restore(&bytes).unwrap());
+        restore_ms.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    println!(
+        "\nsnapshot of the rules scenario ({} units): {} bytes ({:.2} MiB); save median {:.2} ms, restore median {:.2} ms",
+        sim.unit_count(),
+        bytes.len(),
+        bytes.len() as f64 / 1048576.0,
+        median(save_ms),
+        median(restore_ms)
+    );
+
     bench_rules(units);
     bench_worst_cases(units);
 }

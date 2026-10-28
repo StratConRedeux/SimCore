@@ -1,7 +1,8 @@
 //! C API for SimCore. Implements `include/simcore.h` exactly; see `docs/ffi-contract.md`.
 //!
 //! Every export:
-//! - accepts a NULL handle and returns a safe default (NULL, 0, or an empty [`ScFrame`]);
+//! - accepts a NULL handle and returns a safe default (NULL, 0, `UINT32_MAX` for a link delay,
+//!   or an empty [`ScFrame`], [`ScStatus`] or [`ScBytes`]);
 //! - catches unwinding, so no panic crosses the boundary. Release builds use `panic = "abort"`,
 //!   where a panic aborts the process instead; that is also defined behaviour.
 //!
@@ -10,8 +11,10 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-pub use simcore_abi::{ABI_VERSION, ScFrame, ScUnitView, TICKS_PER_SECOND};
-use simcore_engine::Sim;
+pub use simcore_abi::{
+    ABI_VERSION, ScBytes, ScCommand, ScFrame, ScStatus, ScUnitView, TICKS_PER_SECOND, command,
+};
+use simcore_engine::{Order, Position, Sim, StableId};
 
 /// Opaque world handle (`ScWorld` in the header). C only ever sees a pointer to it.
 pub struct ScWorld {
@@ -116,7 +119,7 @@ pub unsafe extern "C" fn sc_world_tick(world: *const ScWorld) -> u64 {
 /// `ScFrame sc_world_frame(ScWorld *world);` Returns [`empty_frame`] on NULL or failure.
 ///
 /// The returned `units` points into the engine's reused frame buffer (no copy) and stays valid
-/// until the next `sc_world_step`, `sc_world_frame` or `sc_world_destroy` on this handle.
+/// until the next `sc_world_frame` or `sc_world_destroy` on this handle.
 ///
 /// # Safety
 /// `world` is NULL or a live handle, not used concurrently from another thread.
@@ -146,6 +149,151 @@ pub unsafe extern "C" fn sc_world_frame(world: *mut ScWorld) -> ScFrame {
     })
 }
 
+/// `void sc_world_despawn_removed(ScWorld *world);` No-op on NULL.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_despawn_removed(world: *mut ScWorld) {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return;
+    };
+    guard((), || w.sim.despawn_removed());
+}
+
+/// `ScStatus sc_world_status(ScWorld *world);` All zeros on NULL or failure.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_status(world: *mut ScWorld) -> ScStatus {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return ScStatus::default();
+    };
+    guard(ScStatus::default(), || w.sim.status())
+}
+
+/// `uint32_t sc_world_link_delay(ScWorld *world, uint64_t unit_id);` `UINT32_MAX` on NULL, an
+/// unknown unit, or failure; real delays are capped at `UINT32_MAX - 1`.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_link_delay(world: *mut ScWorld, unit_id: u64) -> u32 {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return u32::MAX;
+    };
+    guard(u32::MAX, || {
+        w.sim.link_delay(StableId(unit_id)).unwrap_or(u32::MAX)
+    })
+}
+
+/// Converts a C command to an engine order, resolving positions relative to the command node.
+/// `None` for an unknown type, non-zero reserved fields, or a `radiate` other than 0 or 1.
+fn order(sim: &Sim, c: &ScCommand) -> Option<Order> {
+    if c._reserved0 != 0 || c._reserved1 != 0 {
+        return None;
+    }
+    Some(match c.type_ {
+        command::MOVE => {
+            let node = sim.position(StableId(1)).unwrap_or_default();
+            Order::Move {
+                destination: Position {
+                    x: node.x + f64::from(c.x),
+                    y: node.y + f64::from(c.y),
+                    z: node.z + f64::from(c.z),
+                },
+                speed_mps: f64::from(c.speed_mps),
+            }
+        }
+        command::HALT => Order::Halt,
+        command::RETARGET => Order::Retarget {
+            target: StableId(c.target_id),
+        },
+        command::EMISSIONS if c.radiate <= 1 => Order::Emissions {
+            radiate: c.radiate == 1,
+        },
+        _ => return None,
+    })
+}
+
+/// `uint64_t sc_world_command(ScWorld *world, const ScCommand *command);` Returns the command
+/// id (from 1), or 0 if the command is rejected, either handle is NULL, or the call fails.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread; `command` is
+/// NULL or points to a readable `ScCommand`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_command(world: *mut ScWorld, command: *const ScCommand) -> u64 {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return 0;
+    };
+    // SAFETY: NULL or a readable ScCommand (caller contract). Copied out at once.
+    let Some(c) = (unsafe { command.as_ref() }).copied() else {
+        return 0;
+    };
+    guard(0, || {
+        order(&w.sim, &c)
+            .and_then(|o| w.sim.command(StableId(c.unit_id), o).ok())
+            .unwrap_or(0)
+    })
+}
+
+const fn empty_bytes() -> ScBytes {
+    ScBytes {
+        data: std::ptr::null(),
+        len: 0,
+    }
+}
+
+/// `ScBytes sc_world_save(ScWorld *world);` Empty (NULL, 0) on NULL or failure.
+///
+/// `data` points into the engine's reused snapshot buffer and stays valid until the next
+/// `sc_world_save` or `sc_world_destroy` on this handle.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_save(world: *mut ScWorld) -> ScBytes {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return empty_bytes();
+    };
+    guard(empty_bytes(), || {
+        let bytes = w.sim.save();
+        ScBytes {
+            data: bytes.as_ptr(),
+            len: bytes.len() as u64,
+        }
+    })
+}
+
+/// `ScWorld *sc_world_restore(const uint8_t *data, uint64_t len);` Returns NULL if `data` is
+/// NULL, the bytes are not a snapshot this build reads, they are damaged, or the call fails.
+///
+/// # Safety
+/// `data` is NULL or points to `len` readable bytes that are not modified during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_restore(data: *const u8, len: u64) -> *mut ScWorld {
+    let Ok(len) = usize::try_from(len) else {
+        return std::ptr::null_mut();
+    };
+    if data.is_null() || len > isize::MAX as usize {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: non-null and `len` readable, unmodified bytes (caller contract), within
+    // `isize::MAX`.
+    let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+    guard(std::ptr::null_mut(), || match Sim::restore(bytes) {
+        Ok(sim) => into_handle(sim),
+        Err(_) => std::ptr::null_mut(),
+    })
+}
+
 /// The exports with the exact C signatures from `include/simcore.h`. If a signature drifts,
 /// this stops compiling.
 const _: () = {
@@ -156,6 +304,12 @@ const _: () = {
     let _: unsafe extern "C" fn(*mut ScWorld, u32) = sc_world_step;
     let _: unsafe extern "C" fn(*const ScWorld) -> u64 = sc_world_tick;
     let _: unsafe extern "C" fn(*mut ScWorld) -> ScFrame = sc_world_frame;
+    let _: unsafe extern "C" fn(*mut ScWorld) = sc_world_despawn_removed;
+    let _: unsafe extern "C" fn(*mut ScWorld) -> ScStatus = sc_world_status;
+    let _: unsafe extern "C" fn(*mut ScWorld, u64) -> u32 = sc_world_link_delay;
+    let _: unsafe extern "C" fn(*mut ScWorld, *const ScCommand) -> u64 = sc_world_command;
+    let _: unsafe extern "C" fn(*mut ScWorld) -> ScBytes = sc_world_save;
+    let _: unsafe extern "C" fn(*const u8, u64) -> *mut ScWorld = sc_world_restore;
 };
 
 #[cfg(test)]
@@ -210,6 +364,108 @@ mod tests {
     #[test]
     fn unrepresentable_unit_count_is_null() {
         assert!(sc_world_create_dummy(1, u32::MAX).is_null());
+    }
+
+    #[test]
+    fn new_calls_accept_null() {
+        // SAFETY: NULL is an accepted input for every handle and pointer argument.
+        unsafe {
+            sc_world_despawn_removed(std::ptr::null_mut());
+            assert_eq!(sc_world_status(std::ptr::null_mut()), ScStatus::default());
+            assert_eq!(sc_world_link_delay(std::ptr::null_mut(), 1), u32::MAX);
+            let c = ScCommand::default();
+            assert_eq!(sc_world_command(std::ptr::null_mut(), &c), 0);
+            let w = sc_world_create(1);
+            assert_eq!(sc_world_command(w, std::ptr::null()), 0);
+            let b = sc_world_save(std::ptr::null_mut());
+            assert!(b.data.is_null() && b.len == 0);
+            assert!(sc_world_restore(std::ptr::null(), 10).is_null());
+            assert!(sc_world_restore(b"SCSN".as_ptr(), 4).is_null());
+            sc_world_destroy(w);
+        }
+    }
+
+    #[test]
+    fn command_status_save_restore() {
+        let w = sc_world_create_dummy(3, 300);
+        // SAFETY: `w` and `r` are live handles used only on this thread, each destroyed once;
+        // `saved` is copied out of the engine buffer before the next call on `w`.
+        unsafe {
+            let units = {
+                let f = sc_world_frame(w);
+                std::slice::from_raw_parts(f.units, f.count as usize).to_vec()
+            };
+            let friendly = units
+                .iter()
+                .find(|u| u.affiliation == simcore_abi::affiliation::FRIENDLY && u.id != 1)
+                .unwrap();
+            let hostile = units
+                .iter()
+                .find(|u| u.affiliation == simcore_abi::affiliation::HOSTILE)
+                .unwrap();
+            let mv = ScCommand {
+                unit_id: friendly.id,
+                x: friendly.x + 30.0,
+                y: friendly.y,
+                z: friendly.z,
+                speed_mps: 10.0,
+                type_: command::MOVE,
+                ..ScCommand::default()
+            };
+            assert_eq!(sc_world_link_delay(w, friendly.id), 0);
+            assert_eq!(sc_world_link_delay(w, 99_999), u32::MAX);
+            assert_eq!(sc_world_command(w, &mv), 1);
+            for bad in [
+                ScCommand {
+                    unit_id: hostile.id,
+                    ..mv
+                },
+                ScCommand {
+                    _reserved1: 1,
+                    ..mv
+                },
+                ScCommand {
+                    speed_mps: 0.0,
+                    ..mv
+                },
+                ScCommand { type_: 99, ..mv },
+                ScCommand {
+                    type_: command::EMISSIONS,
+                    radiate: 2,
+                    ..mv
+                },
+            ] {
+                assert_eq!(sc_world_command(w, &bad), 0, "{bad:?}");
+            }
+            assert_eq!(sc_world_status(w).pending_commands, 1);
+
+            let b = sc_world_save(w);
+            assert!(!b.data.is_null() && b.len > 0);
+            let saved = std::slice::from_raw_parts(b.data, b.len as usize).to_vec();
+            let r = sc_world_restore(saved.as_ptr(), saved.len() as u64);
+            assert!(!r.is_null());
+            assert_eq!(sc_world_status(r), sc_world_status(w));
+
+            // Both deliver the move and travel the same 30 m: 45 ticks at 10 m/s.
+            sc_world_step(w, 60);
+            sc_world_step(r, 60);
+            let pos = |h| {
+                let f = sc_world_frame(h);
+                let u = std::slice::from_raw_parts(f.units, f.count as usize);
+                let u = u.iter().find(|u| u.id == friendly.id).unwrap();
+                (u.x, u.y, u.vx)
+            };
+            let (pw, pr) = (pos(w), pos(r));
+            assert_eq!(pw, pr);
+            assert!(
+                (pw.0 - mv.x).abs() < 0.5 && pw.2 == 0.0,
+                "arrived and stopped: {pw:?}"
+            );
+            assert_eq!(sc_world_status(w), sc_world_status(r));
+            sc_world_despawn_removed(w);
+            sc_world_destroy(w);
+            sc_world_destroy(r);
+        }
     }
 
     #[cfg(panic = "unwind")]

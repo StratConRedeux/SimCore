@@ -14,13 +14,16 @@ y north, z up (absolute altitude).
 
 Each tick of `DT = 1/15 s` runs, single-threaded and always in this order:
 
-1. **Emitter duty cycles** (`EmitterCycle`): set `EmsProfile::emitting` for the tick.
-2. **Observation**: mark units observed by an opposing sensor.
-3. **Exposure** update.
-4. **Detected** flag.
-5. **Pursuit steering**: set pursuers' velocities.
-6. **Movement**: explicit Euler, `position += velocity * DT`.
-7. **Engagement resolution**: swept checks, outcome rolls, removals.
+1. **Command delivery**: commands due this tick are applied (see Commands and link delay).
+2. **Emitter duty cycles** (`EmitterCycle`): set `EmsProfile::emitting` for the tick, except for
+   silent units (`Emcon`), which stay off.
+3. **Observation**: mark units observed by an opposing sensor.
+4. **Exposure** update.
+5. **Detected** flag.
+6. **Pursuit steering**: set pursuers' velocities.
+7. **Move orders**: set moving units' velocities toward their destinations.
+8. **Movement**: explicit Euler, `position += velocity * DT`.
+9. **Engagement resolution**: swept checks, outcome rolls, removals.
 
 ## Detection range
 
@@ -139,8 +142,8 @@ from the outcome table for `(outcome_class, target kind)`.
   may target it (a hostile drone aimed at the player's node is an ordinary scenario), and a
   successful roll is reported as a **command-node hit**, but the node stays. The pursuer is
   removed either way.
-- Hits are gathered and resolved in ECS query order, which is deterministic. A hit is skipped if
-  an earlier hit this tick already removed its pursuer or target.
+- Hits are resolved in pursuer id order, never in ECS iteration order, which differs after a
+  restore. A hit is skipped if an earlier hit this tick already removed its pursuer or target.
 - Rolls use the Sim's PCG32, seeded from `Sim::new(seed)` on its own stream, so the same seed and
   inputs give the same outcomes.
 - Each resolution is recorded as an
@@ -162,8 +165,8 @@ from the outcome table for `(outcome_class, target kind)`.
 is despawned later, outside `Sim::step`: on the next spawn, or when the caller calls
 `Sim::despawn_removed`. That keeps `step` free of allocations (bevy_ecs allocates removal queues
 and entity free-list space on despawn). Removed entities hold their storage until then. Frame
-order after removals is ECS storage order: deterministic for the same seed and inputs, but not
-sorted by id.
+order is unspecified: it is ECS storage order, the same for the same history, but different after
+a restore. Identify units by id.
 
 The engagement buffers are sized for the live pursuers whenever a pursuer is spawned; their
 capacity follows the high-water mark of live pursuers.
@@ -253,6 +256,77 @@ Both modes:
   stable (tested with a counting allocator in both modes).
 - Size the cutoff and the grid for the expected emitter density, and build on demand rather
   than every tick.
+
+## Commands and link delay
+
+The player commands **friendly** units (`Sim::command(unit, order)`, `sc_world_command`):
+
+- `Move { destination, speed_mps }`: straight-line travel at a constant speed, landing exactly on
+  the destination at the end of a tick and stopping on the next. A new move replaces the old one.
+  Not for pursuers, whose velocity pursuit steering owns.
+- `Halt`: cancel any move and stop. Not for pursuers.
+- `Retarget { target }`: a pursuer pursues another unit. Pursuers only.
+- `Emissions { radiate }`: silence a unit, or let it radiate again. A silent duty-cycled emitter
+  stays off; a radiating one follows its cycle. A unit without a cycle simply turns on or off.
+
+A command is checked when issued, and rejected (with a `CommandError`) for an unknown or
+non-friendly unit, the wrong unit type, a non-finite destination, a speed that is not positive
+and finite, or a retarget at itself or at a unit that does not exist. Commands get increasing ids
+from 1. Over the C API positions are `f32` metres relative to the command node at issue, and are
+converted to world coordinates at once.
+
+**Link delay** (`LinkRules`, `Sim::set_link_rules`), computed once at issue, in ticks:
+
+    delay = base_delay_ticks
+          + ceil(delay_ticks_per_km * distance from the command node in km)
+          + jam_delay_ticks, if an emitting hostile jammer (kind JAMMER) is within jam_radius_m
+    capped at max_delay_ticks
+
+Non-positive or NaN per-km rates and jam radii add nothing; an infinite rate reaches the cap at
+any non-zero distance (zero distance adds nothing). Delays never exceed `u32::MAX - 1`, since the
+C API uses `UINT32_MAX` for "no such unit". A move whose destination is too far to represent the
+way there (the coordinate difference overflows `f64`) ends where the unit stands. The
+default delivers every command on the next tick. A command issued at tick `t` with delay `d` is
+applied at the start of the tick that begins at `t + d`. If its unit (or a retarget's target) is
+gone by then, it is dropped and counted (`ScStatus::dropped_commands`). `Sim::link_delay(id)`
+previews the delay; the status reports the delay at the command node itself.
+
+The jammer check scans the units once per call: commands and link-delay previews are per player
+action, not per tick.
+
+## Status
+
+`Sim::status()` (`sc_world_status`) summarises live units for the HUD: tick, unit count, the
+command node's link delay, friendly units emitting, friendly units detected by the hostile side,
+hostile units detected by the friendly side, pending and dropped commands, command-node hits,
+and removed units awaiting `despawn_removed`. One pass over the units: cheap enough for every
+frame.
+
+## Save and restore
+
+`Sim::save()` (`sc_world_save`) writes the whole world: clock, ids, the engagement PRNG, rules,
+link rules, terrain, every unit's components, moves in progress and queued commands. The format
+is versioned, little-endian and checksummed (FNV-1a 64); it is not meant to be read by anything
+but `Sim::restore`. Units are written in id order, so the bytes are canonical: saving a restored
+world gives the same bytes.
+
+`Sim::restore(bytes)` (`sc_world_restore`) gives a world that continues exactly as the saved one
+would have: same frames (by id), events, rolls and status, tested over hundreds of ticks with new
+commands on both. It rejects other formats, damaged bytes (any single-bit error is caught by the
+checksum) and impossible worlds (duplicate or out-of-range ids, no command node, invalid
+terrain, ticks or command ids at or above `2^62`, moves and queued commands that could never
+have been accepted, deliveries more than `u32::MAX` ticks away), and never panics: tested on every truncation and on 20,000 randomly tampered payloads
+with the checksum recomputed. Ids are limited to below `2^24`, which bounds what a snapshot can
+make the engine allocate for its id index (8 bytes per id up to the largest: 128 MiB). A world
+that has spawned 16.7 million units cannot be restored; play spawns thousands. Restore time is
+linear in the snapshot's size.
+
+The engine depends on ECS iteration order nowhere that affects the simulation: bevy_ecs matches
+archetypes through a hash map, so a restored world iterates in a different order. Engagement
+hits are sorted by pursuer id, and heatmap emitters are sorted before summing.
+
+**Catching up after time away** is the caller's policy. The Swift binding offers
+`SimWorld.catchUp(elapsedTicks:maxTicks:)`, which runs at most `maxTicks`.
 
 ## Floating origin
 

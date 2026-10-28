@@ -109,3 +109,62 @@ private enum Environment {
         ProcessInfo.processInfo.environment[name] == "1"
     }
 }
+
+/// Contract revision 1.2: commands, status, link delay, cleanup, save and restore.
+@Suite struct ContractRevision12Tests {
+    @Test func contractLayoutsMatchHeader() {
+        #expect(MemoryLayout<ScCommand>.size == 40)
+        #expect(MemoryLayout<ScCommand>.alignment == 8)
+        #expect(MemoryLayout<ScCommand>.offset(of: \.type) == 32)
+        #expect(MemoryLayout<ScStatus>.size == 48)
+        #expect(MemoryLayout<ScBytes>.size == 16)
+    }
+
+    @Test func commandsStatusAndLinkDelay() throws {
+        let world = try #require(SimWorld(seed: 4, dummyUnits: 200))
+        #expect(world.linkDelay(unit: 1) == 0)
+        #expect(world.linkDelay(unit: 1 << 40) == nil)
+        let id = world.command(1, .move(x: 30, y: 0, z: 0, speedMps: 10))
+        #expect(id == 1)
+        #expect(world.command(1, .move(x: 30, y: 0, z: 0, speedMps: 0)) == nil)
+        #expect(world.command(1, .retarget(2)) == nil, "the command node is not a pursuer")
+        #expect(world.command(1 << 40, .halt) == nil)
+        #expect(world.status.pending_commands == 1)
+        world.step(60)
+        let s = world.status
+        #expect(s.tick == 60 && s.pending_commands == 0 && s.unit_count == 201)
+        world.despawnRemoved()
+    }
+
+    @Test func saveAndRestoreContinueIdentically() throws {
+        let a = try #require(SimWorld(seed: 8, dummyUnits: 2000))
+        a.step(45)
+        a.command(1, .move(x: -50, y: 20, z: 0, speedMps: 5))
+        let bytes = a.save()
+        #expect(!bytes.isEmpty)
+        let b = try #require(SimWorld(snapshot: bytes))
+        #expect(b.save() == bytes, "canonical bytes")
+        a.step(90)
+        b.step(90)
+        #expect(a.status.tick == b.status.tick)
+        // Frame order is unspecified after a restore: compare by id.
+        func sorted(_ w: SimWorld) -> [UInt8] {
+            w.withFrame { units in
+                units.sorted { $0.id < $1.id }.withUnsafeBytes { Array($0) }
+            }
+        }
+        #expect(sorted(a) == sorted(b))
+
+        var damaged = bytes
+        damaged[damaged.count / 2] ^= 0x10
+        #expect(SimWorld(snapshot: damaged) == nil)
+        #expect(SimWorld(snapshot: Data()) == nil)
+    }
+
+    @Test func catchUpIsCapped() throws {
+        let w = try #require(SimWorld(seed: 1))
+        #expect(w.catchUp(elapsedTicks: 10, maxTicks: 100) == 10)
+        #expect(w.catchUp(elapsedTicks: 1_000_000, maxTicks: 300) == 300)
+        #expect(w.tick == 310)
+    }
+}

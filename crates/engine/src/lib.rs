@@ -4,13 +4,16 @@
 //! rate of [`TICKS_PER_SECOND`]. The engine never reads the wall clock: callers decide how many
 //! ticks to run with [`Sim::step`] and read the result with [`Sim::frame`].
 //!
-//! Each tick runs, in order: emitter duty cycles, observation, exposure, the detected flag,
-//! pursuit steering, movement, then engagement resolution. See `docs/rules.md`.
+//! Each tick runs, in order: command delivery, emitter duty cycles, observation, exposure, the
+//! detected flag, pursuit steering, move orders, movement, then engagement resolution. See
+//! `docs/rules.md`.
 
 mod components;
 mod gameplay;
 mod grid;
+mod orders;
 mod rng;
+mod snapshot;
 mod terrain;
 
 use components::Gone;
@@ -22,13 +25,16 @@ pub use gameplay::{
     EmitterView, EngagementEvent, Heatmap, HeatmapSpec, OutcomeTable, Rules, SensorView, opposing,
     sensor_observes,
 };
+pub use orders::{CommandError, Emcon, LinkRules, Order};
 pub use rng::Pcg32;
-pub use simcore_abi::{ScUnitView, TICKS_PER_SECOND};
+pub use simcore_abi::{ScStatus, ScUnitView, TICKS_PER_SECOND};
+pub use snapshot::{SNAPSHOT_FORMAT_VERSION, SnapshotError};
 pub use terrain::Terrain;
 
 use bevy_ecs::prelude::*;
 use bevy_ecs::schedule::SingleThreadedExecutor;
 use gameplay::{Engagements, IdIndex, Scratch};
+use orders::{CommandQueue, JammerQuery, Moves, Pending};
 use simcore_abi::{affiliation, flags};
 use simcore_rules::to_local_f32;
 
@@ -82,6 +88,13 @@ type HeatQuery = (
     &'static Gone,
 );
 
+type StatusQuery = (
+    &'static Affiliation,
+    &'static EmsProfile,
+    &'static Detected,
+    &'static Gone,
+);
+
 /// One simulated world.
 pub struct Sim {
     world: World,
@@ -93,38 +106,18 @@ pub struct Sim {
     engagements: Engagements,
     heat_query: QueryState<HeatQuery>,
     heatmap: Heatmap,
+    commands: CommandQueue,
+    jammer_query: JammerQuery,
+    status_query: QueryState<StatusQuery>,
+    snapshot: Vec<u8>,
 }
 
 impl Sim {
     /// An empty world with the player's command node at the origin.
     pub fn new(seed: u64) -> Sim {
-        let mut world = World::new();
-        world.insert_resource(SimClock::default());
-        world.insert_resource(Rules::default());
-        world.insert_resource(Terrain::flat());
-        world.insert_resource(IdIndex::default());
-        world.insert_resource(Scratch::default());
-
-        let mut schedule = Schedule::default();
-        schedule.set_executor(SingleThreadedExecutor::new());
-        schedule.add_systems(
-            (
-                update_emitters,
-                gameplay::observe,
-                gameplay::update_exposure,
-                gameplay::update_detected,
-                gameplay::steer_pursuers,
-                integrate_movement,
-            )
-                .chain(),
-        );
-
-        let frame_query = world.query::<FrameQuery>();
-        let heat_query = world.query::<HeatQuery>();
-        // The seed drives engagement rolls.
-        let engagements = Engagements::new(&mut world, seed);
-
-        let command_node = world
+        let mut sim = Sim::without_units(seed);
+        let command_node = sim
+            .world
             .spawn((
                 StableId(1),
                 CommandNode,
@@ -136,22 +129,64 @@ impl Sim {
                 Exposure::default(),
                 Detected::default(),
                 Gone::default(),
+                Emcon::default(),
             ))
             .id();
-        world
+        sim.world
             .resource_mut::<IdIndex>()
             .insert(StableId(1), command_node);
+        sim.command_node = command_node;
+        sim.next_id = 2;
+        sim
+    }
+
+    /// Everything but the units. `command_node` is a placeholder until one is spawned.
+    fn without_units(seed: u64) -> Sim {
+        let mut world = World::new();
+        world.insert_resource(SimClock::default());
+        world.insert_resource(Rules::default());
+        world.insert_resource(LinkRules::default());
+        world.insert_resource(Terrain::flat());
+        world.insert_resource(IdIndex::default());
+        world.insert_resource(Scratch::default());
+        world.insert_resource(Moves::default());
+
+        let mut schedule = Schedule::default();
+        schedule.set_executor(SingleThreadedExecutor::new());
+        schedule.add_systems(
+            (
+                update_emitters,
+                gameplay::observe,
+                gameplay::update_exposure,
+                gameplay::update_detected,
+                gameplay::steer_pursuers,
+                orders::follow_moves,
+                integrate_movement,
+            )
+                .chain(),
+        );
+
+        let frame_query = world.query::<FrameQuery>();
+        let heat_query = world.query::<HeatQuery>();
+        let jammer_query = world.query();
+        let status_query = world.query::<StatusQuery>();
+        // The seed drives engagement rolls.
+        let engagements = Engagements::new(&mut world, seed);
 
         Sim {
             world,
             schedule,
-            command_node,
-            next_id: 2,
+            command_node: Entity::PLACEHOLDER,
+            next_id: 1,
             frame_query,
             frame: Vec::new(),
             engagements,
             heat_query,
             heatmap: Heatmap::default(),
+            commands: CommandQueue::default(),
+            jammer_query,
+            status_query,
+            snapshot: Vec::new(),
         }
     }
 
@@ -259,6 +294,7 @@ impl Sim {
             Exposure::default(),
             Detected::default(),
             Gone::default(),
+            Emcon::default(),
             extra,
         ));
         if let Some(cycle) = spec.cycle {
@@ -286,6 +322,84 @@ impl Sim {
 
     pub fn rules(&self) -> &Rules {
         self.world.resource::<Rules>()
+    }
+
+    /// Replaces the link-delay rules for commands issued from now on.
+    pub fn set_link_rules(&mut self, rules: LinkRules) {
+        self.world.insert_resource(rules);
+    }
+
+    pub fn link_rules(&self) -> &LinkRules {
+        self.world.resource::<LinkRules>()
+    }
+
+    /// Queues `order` for unit `unit`, to be applied after the link delay. Returns the command
+    /// id (from 1, in issue order).
+    ///
+    /// A command issued now, at tick `t`, with delay `d`, is applied at the start of the tick
+    /// that begins at `t + d`: with no delay, on the next tick run. It is checked now and again
+    /// when it arrives; if its recipient (or a retarget's target) is gone by then it is dropped
+    /// and counted in [`ScStatus::dropped_commands`].
+    pub fn command(&mut self, unit: StableId, order: Order) -> Result<u64, CommandError> {
+        orders::validate(&self.world, unit, &order)?;
+        let delay = self.link_delay(unit).ok_or(CommandError::UnknownUnit)?;
+        // Neither can overflow in practice (2^64 commands or ticks); saturating keeps a
+        // hand-made world from panicking in debug builds.
+        self.commands.last_seq = self.commands.last_seq.saturating_add(1);
+        let seq = self.commands.last_seq;
+        self.commands.push(Pending {
+            deliver_tick: self.tick().saturating_add(u64::from(delay)),
+            seq,
+            unit,
+            order,
+        });
+        Ok(seq)
+    }
+
+    /// The link delay, in ticks, of a command issued now to unit `id`, if it exists.
+    pub fn link_delay(&mut self, id: StableId) -> Option<u32> {
+        let at = self.position(id)?;
+        let node = self.command_node_position();
+        Some(orders::link_delay(
+            &self.world,
+            &mut self.jammer_query,
+            node,
+            at,
+        ))
+    }
+
+    /// Commands queued and not yet delivered.
+    pub fn pending_commands(&self) -> u32 {
+        u32::try_from(self.commands.pending.len()).unwrap_or(u32::MAX)
+    }
+
+    /// A summary for the HUD: counts are of live units, and the link delay is that of a
+    /// command to the command node itself (the base delay plus any jamming there).
+    pub fn status(&mut self) -> ScStatus {
+        let mut s = ScStatus {
+            tick: self.tick(),
+            unit_count: self.unit_count(),
+            link_delay_ticks: self.link_delay(StableId(1)).unwrap_or(0),
+            pending_commands: self.pending_commands(),
+            dropped_commands: self.commands.dropped,
+            command_node_hits: self.command_node_hits(),
+            awaiting_cleanup: self.engagements.awaiting_despawn(),
+            ..ScStatus::default()
+        };
+        for (a, ems, detected, gone) in self.status_query.iter(&self.world) {
+            if gone.0 {
+                continue;
+            }
+            match a.0 {
+                affiliation::FRIENDLY => {
+                    s.friendly_emitting += u32::from(ems.current_power_w() > 0.0);
+                    s.friendly_detected += u32::from(detected.0);
+                }
+                affiliation::HOSTILE => s.hostile_detected += u32::from(detected.0),
+                _ => {}
+            }
+        }
+        s
     }
 
     /// Replaces the terrain used for line of sight.
@@ -368,6 +482,8 @@ impl Sim {
     pub fn step(&mut self, ticks: u32) {
         self.engagements.events.clear();
         for _ in 0..ticks {
+            let now = self.world.resource::<SimClock>().tick;
+            self.commands.deliver(&mut self.world, now);
             self.schedule.run(&mut self.world);
             let tick = self.world.resource::<SimClock>().tick + 1;
             // Engagement resolution removes units, so it runs with exclusive world access as
@@ -454,14 +570,14 @@ impl Sim {
     }
 }
 
-/// Applies each emitter's duty cycle for the current tick.
+/// Applies each emitter's duty cycle for the current tick. A silent unit ([`Emcon`]) stays off.
 ///
 /// Removed ([`Gone`]) units keep cycling: every reader of `emitting` skips them, and filtering
 /// here would make this pass about 2.5x slower.
-fn update_emitters(clock: Res<SimClock>, mut q: Query<(&EmitterCycle, &mut EmsProfile)>) {
+fn update_emitters(clock: Res<SimClock>, mut q: Query<(&EmitterCycle, &Emcon, &mut EmsProfile)>) {
     let tick = clock.tick;
-    for (cycle, mut ems) in &mut q {
-        let on = cycle.is_on(tick);
+    for (cycle, emcon, mut ems) in &mut q {
+        let on = !emcon.silent && cycle.is_on(tick);
         // Only touch the component when it changes, so change detection stays meaningful.
         if ems.emitting != on {
             ems.emitting = on;

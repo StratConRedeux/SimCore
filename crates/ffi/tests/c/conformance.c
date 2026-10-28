@@ -17,6 +17,18 @@ _Static_assert(offsetof(ScUnitView, affiliation) == 34, "affiliation");
 _Static_assert(offsetof(ScUnitView, flags) == 35, "flags");
 _Static_assert(offsetof(ScUnitView, ems_power_w) == 36, "ems_power_w");
 _Static_assert(sizeof(ScFrame) == 24, "ScFrame size");
+_Static_assert(sizeof(ScCommand) == 40, "ScCommand size");
+_Static_assert(_Alignof(ScCommand) == 8, "ScCommand align");
+_Static_assert(offsetof(ScCommand, target_id) == 8, "target_id");
+_Static_assert(offsetof(ScCommand, x) == 16, "command x");
+_Static_assert(offsetof(ScCommand, speed_mps) == 28, "speed_mps");
+_Static_assert(offsetof(ScCommand, type) == 32, "type");
+_Static_assert(offsetof(ScCommand, radiate) == 34, "radiate");
+_Static_assert(offsetof(ScCommand, _reserved1) == 36, "_reserved1");
+_Static_assert(sizeof(ScStatus) == 48, "ScStatus size");
+_Static_assert(offsetof(ScStatus, unit_count) == 8, "unit_count");
+_Static_assert(offsetof(ScStatus, awaiting_cleanup) == 40, "awaiting_cleanup");
+_Static_assert(sizeof(ScBytes) == 16, "ScBytes size");
 
 /* Every function, through a pointer of exactly the header's type. */
 static uint32_t (*const p_abi_version)(void) = sc_abi_version;
@@ -26,6 +38,12 @@ static void (*const p_destroy)(ScWorld *) = sc_world_destroy;
 static void (*const p_step)(ScWorld *, uint32_t) = sc_world_step;
 static uint64_t (*const p_tick)(const ScWorld *) = sc_world_tick;
 static ScFrame (*const p_frame)(ScWorld *) = sc_world_frame;
+static uint64_t (*const p_command)(ScWorld *, const ScCommand *) = sc_world_command;
+static uint32_t (*const p_link_delay)(ScWorld *, uint64_t) = sc_world_link_delay;
+static ScStatus (*const p_status)(ScWorld *) = sc_world_status;
+static void (*const p_despawn_removed)(ScWorld *) = sc_world_despawn_removed;
+static ScBytes (*const p_save)(ScWorld *) = sc_world_save;
+static ScWorld *(*const p_restore)(const uint8_t *, uint64_t) = sc_world_restore;
 
 static int failures = 0;
 #define CHECK(cond)                                                                \
@@ -135,6 +153,53 @@ int main(void) {
     p_destroy(a);
     p_destroy(b);
     p_destroy(c);
+
+    /* Revision 1.2: NULL inputs. */
+    ScCommand none = {0};
+    CHECK(p_command(NULL, &none) == 0);
+    CHECK(p_link_delay(NULL, 1) == UINT32_MAX);
+    ScStatus ns = p_status(NULL);
+    CHECK(ns.tick == 0 && ns.unit_count == 0);
+    p_despawn_removed(NULL);
+    ScBytes nb = p_save(NULL);
+    CHECK(nb.data == NULL && nb.len == 0);
+    CHECK(p_restore(NULL, 0) == NULL);
+
+    /* A command to the command node, a status, a save and a restore. */
+    ScWorld *d = p_create_dummy(5, 1000);
+    CHECK(p_link_delay(d, 1) == 0);
+    CHECK(p_link_delay(d, 1u << 20) == UINT32_MAX);
+    ScCommand mv = {.unit_id = 1, .x = 15.0f, .speed_mps = 15.0f, .type = SC_COMMAND_MOVE};
+    CHECK(p_command(d, NULL) == 0);
+    CHECK(p_command(d, &mv) == 1);
+    ScCommand bad = mv;
+    bad._reserved0 = 1;
+    CHECK(p_command(d, &bad) == 0);
+    ScStatus st = p_status(d);
+    CHECK(st.unit_count == 1001 && st.pending_commands == 1 && st._reserved == 0);
+
+    ScBytes saved = p_save(d);
+    CHECK(saved.data != NULL && saved.len > 0);
+    uint8_t *bytes = malloc((size_t)saved.len);
+    CHECK(bytes != NULL);
+    memcpy(bytes, saved.data, (size_t)saved.len);
+    ScWorld *e = p_restore(bytes, saved.len);
+    CHECK(e != NULL);
+    bytes[saved.len / 2] ^= 1;
+    CHECK(p_restore(bytes, saved.len) == NULL);
+    CHECK(p_restore(bytes, 3) == NULL);
+    free(bytes);
+
+    /* The command node moves 15 m in 15 ticks; the frame stays centred on it. */
+    p_step(d, 20);
+    p_step(e, 20);
+    ScStatus sd = p_status(d), se = p_status(e);
+    CHECK(sd.tick == 20 && sd.pending_commands == 0);
+    CHECK(memcmp(&sd, &se, sizeof sd) == 0);
+    CHECK(p_frame(d).count == p_frame(e).count);
+    p_despawn_removed(d);
+    p_destroy(d);
+    p_destroy(e);
 
     if (failures) {
         fprintf(stderr, "conformance: %d failure(s)\n", failures);

@@ -27,6 +27,13 @@ pub struct OutcomeTable {
 }
 
 impl OutcomeTable {
+    /// The `(class, kind, chance)` entries, sorted by `(class, kind)`.
+    pub fn entries(&self) -> &[(u16, u16, f64)] {
+        &self.entries
+    }
+}
+
+impl OutcomeTable {
     /// An empty table where every pair has `default_chance`.
     pub fn new(default_chance: f64) -> OutcomeTable {
         OutcomeTable {
@@ -255,6 +262,14 @@ pub(crate) struct Scratch {
     /// both are zero (and the rules are unchanged) exposure and detection have nothing to do.
     observed: u32,
     exposed: u32,
+}
+
+impl Scratch {
+    /// Sets the observed and exposed counts after a restore, from the units' exposure.
+    pub fn set_counts(&mut self, observed: u32, exposed: u32) {
+        self.observed = observed;
+        self.exposed = exposed;
+    }
 }
 
 /// Marks every unit observed this tick by at least one opposing sensor.
@@ -524,6 +539,22 @@ impl Engagements {
         self.removed.reserve(2 * n);
     }
 
+    /// Removed units not yet despawned.
+    pub fn awaiting_despawn(&self) -> u32 {
+        u32::try_from(self.removed.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The engagement PRNG's state and the command-node hit counter, for snapshots.
+    pub fn saved_state(&self) -> ((u64, u64), u32) {
+        (self.rng.state(), self.command_node_hits)
+    }
+
+    /// Restores [`Engagements::saved_state`].
+    pub fn restore_state(&mut self, rng: (u64, u64), command_node_hits: u32) {
+        self.rng = Pcg32::from_state(rng);
+        self.command_node_hits = command_node_hits;
+    }
+
     /// Despawns units that engagements removed. Their stable ids are already gone.
     pub fn despawn_removed(&mut self, world: &mut World) {
         for e in self.removed.drain(..) {
@@ -534,9 +565,9 @@ impl Engagements {
     /// Last step of a tick, after movement: every pursuer whose swept approach to its target
     /// over the tick came within its engagement radius rolls once against the outcome table.
     ///
-    /// Hits are gathered in query order, then resolved in that order. A hit is skipped if an
-    /// earlier one this tick already removed its pursuer or its target. The command node is
-    /// never removed.
+    /// Hits are resolved in pursuer id order, so the outcome never depends on the ECS's
+    /// iteration order (which differs after a restore). A hit is skipped if an earlier one this
+    /// tick already removed its pursuer or its target. The command node is never removed.
     ///
     /// Removal takes the unit out of the id index and marks it [`Gone`]; the entity itself is
     /// despawned later, outside `step`, so resolution does not allocate.
@@ -576,6 +607,8 @@ impl Engagements {
                 }
             }
         }
+        // Ids are unique, so the unstable sort is deterministic; it does not allocate.
+        self.hits.sort_unstable_by_key(|h| h.pursuer);
         for k in 0..self.hits.len() {
             let h = self.hits[k];
             let index = world.resource::<IdIndex>();
@@ -1094,6 +1127,13 @@ impl Heatmap {
                 self.emitters.push((p.x, p.y, power));
             }
         }
+        // A canonical order, so the sums (and their rounding) do not depend on the ECS's
+        // iteration order. Equal entries are interchangeable, so ties need no tiebreak.
+        self.emitters.sort_unstable_by(|a, b| {
+            (a.0.total_cmp(&b.0))
+                .then(a.1.total_cmp(&b.1))
+                .then(a.2.total_cmp(&b.2))
+        });
         let theta = spec.far_field_theta();
         let em = &self.emitters;
         if theta.is_some() {

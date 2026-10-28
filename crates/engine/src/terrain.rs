@@ -62,6 +62,21 @@ impl Terrain {
         })
     }
 
+    /// `(origin_x, origin_y, spacing_m, nx, ny, heights_m, los_samples)`, the arguments of
+    /// [`Terrain::heightfield`], or `None` for flat terrain.
+    #[allow(clippy::type_complexity)]
+    pub fn parts(&self) -> Option<(f64, f64, f64, u32, u32, &[f32], u32)> {
+        (!self.is_flat()).then_some((
+            self.origin_x,
+            self.origin_y,
+            self.spacing_m,
+            self.nx,
+            self.ny,
+            &self.heights_m,
+            self.los_samples,
+        ))
+    }
+
     /// Whether this is flat terrain (no heightfield).
     pub fn is_flat(&self) -> bool {
         self.heights_m.is_empty()

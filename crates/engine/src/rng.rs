@@ -22,6 +22,20 @@ impl Pcg32 {
         rng
     }
 
+    /// The raw `(state, increment)`, for snapshots.
+    pub fn state(&self) -> (u64, u64) {
+        (self.state, self.inc)
+    }
+
+    /// A generator continuing from [`Pcg32::state`]. The increment is forced odd, as PCG
+    /// requires.
+    pub fn from_state((state, inc): (u64, u64)) -> Pcg32 {
+        Pcg32 {
+            state,
+            inc: inc | 1,
+        }
+    }
+
     pub fn next_u32(&mut self) -> u32 {
         let old = self.state;
         self.state = old.wrapping_mul(Self::MULT).wrapping_add(self.inc);
