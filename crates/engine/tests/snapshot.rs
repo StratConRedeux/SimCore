@@ -344,38 +344,55 @@ fn out_of_range_counters_are_rejected() {
     }
 }
 
-#[test]
-fn many_moves_restore_in_linear_time() {
+/// A world of `n` friendly units, all moving, saved mid-move.
+fn moving_world(n: u32) -> Sim {
     let mut sim = Sim::new(1);
-    let ids: Vec<StableId> = (0..40_000)
-        .map(|i| {
-            sim.spawn_unit(unit(
-                FRIENDLY,
-                kind::GROUND_VEHICLE,
-                p(f64::from(i), 0.0, 0.0),
-                0.0,
-            ))
-        })
-        .collect();
-    for &id in &ids {
-        sim.command(
-            id,
-            Order::Move {
-                destination: p(0.0, 1e4, 0.0),
-                speed_mps: 5.0,
-            },
-        )
-        .unwrap();
+    for i in 0..n {
+        let id = sim.spawn_unit(unit(
+            FRIENDLY,
+            kind::GROUND_VEHICLE,
+            p(f64::from(i), 0.0, 0.0),
+            0.0,
+        ));
+        let to = Order::Move {
+            destination: p(0.0, 1e4, 0.0),
+            speed_mps: 5.0,
+        };
+        sim.command(id, to).unwrap();
     }
     sim.step(1);
-    let bytes = sim.save().to_vec();
-    let t = std::time::Instant::now();
-    let mut b = Sim::restore(&bytes).unwrap();
-    let ms = t.elapsed().as_secs_f64() * 1e3;
-    println!("restore with 40,000 moves: {ms:.1} ms");
-    // Quadratic duplicate checks took about 250 ms in release here; linear is a few ms.
-    assert!(ms < 100.0, "{ms} ms");
-    sim.step(5);
+    sim
+}
+
+/// Fastest of three restores, in seconds.
+fn restore_secs(bytes: &[u8]) -> f64 {
+    (0..3)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            std::hint::black_box(Sim::restore(bytes).unwrap());
+            t.elapsed().as_secs_f64()
+        })
+        .fold(f64::MAX, f64::min)
+}
+
+#[test]
+fn many_moves_restore_in_linear_time() {
+    // Scaling, not wall-clock time, so it holds on slow CI runners and in debug builds:
+    // four times the moves must cost well under the sixteen times a quadratic check would.
+    let small = moving_world(10_000).save().to_vec();
+    let mut big_sim = moving_world(40_000);
+    let big = big_sim.save().to_vec();
+    let (ts, tb) = (restore_secs(&small), restore_secs(&big));
+    println!(
+        "restore: 10,000 moves {:.1} ms, 40,000 moves {:.1} ms ({:.1}x)",
+        ts * 1e3,
+        tb * 1e3,
+        tb / ts
+    );
+    assert!(tb / ts < 8.0, "{:.1}x for 4x the moves", tb / ts);
+
+    let mut b = Sim::restore(&big).unwrap();
+    big_sim.step(5);
     b.step(5);
-    assert!(bits(sim.frame()) == bits(b.frame()));
+    assert!(bits(big_sim.frame()) == bits(b.frame()));
 }
