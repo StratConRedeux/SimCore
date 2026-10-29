@@ -1,4 +1,4 @@
-/* SimCore C API, header revision 1.4 (ABI version 1). Must match crates/abi/src/lib.rs byte for byte. */
+/* SimCore C API, header revision 1.5 (ABI version 1). Must match crates/abi/src/lib.rs byte for byte. */
 #ifndef SIMCORE_H
 #define SIMCORE_H
 
@@ -22,6 +22,7 @@ extern "C" {
 /* Typed constants, so Swift imports them with the field types they are compared against. */
 static const uint32_t SC_ABI_VERSION = 1;
 static const uint32_t SC_TICKS_PER_SECOND = 15;
+static const uint32_t SC_MAX_STANDING_ORDERS = 64; /* revision 1.5 */
 
 static const uint8_t SC_AFFILIATION_UNKNOWN = 0;
 static const uint8_t SC_AFFILIATION_FRIENDLY = 1;
@@ -224,6 +225,39 @@ typedef struct ScSensor {
     double reference_power_w;
 } ScSensor;
 
+/* Revision 1.5: standing orders. Engage detected hostiles in a zone: at the end of each tick,
+   an order with stock left and its cooldown over launches `launch` at the nearest detected
+   hostile inside the zone (matching `kinds`) that no friendly pursuer is already after. The
+   zone centre is metres relative to the command node when the call is made, then fixed in the
+   world; the zone is a horizontal disc. `launch` is friendly, has SC_SPAWN_PURSUER and not
+   SC_SPAWN_SENSOR; its position is relative to the command node at each launch, it leaves
+   heading straight at the contact, and its velocity and target_id are ignored. 152 bytes. */
+typedef struct ScStandingOrder {
+    double x, y;              /* zone centre */
+    double radius_m;          /* positive */
+    uint32_t kinds;           /* bit k engages kind k; 0 engages every kind */
+    uint32_t stock;           /* launches available, at most UINT32_MAX - 1 */
+    uint32_t cooldown_ticks;  /* ticks after a launch before the next; 0 and 1 both allow one per tick */
+    uint32_t _reserved;
+    ScUnitSpec launch;
+} ScStandingOrder;
+
+/* One launch by a standing order. 32 bytes. */
+typedef struct ScLaunch {
+    uint64_t tick;        /* tick count once the launch's tick completed */
+    uint64_t order_id;
+    uint64_t pursuer_id;  /* the launched unit; its ScEngagement names it as the pursuer */
+    uint64_t target_id;
+} ScLaunch;
+
+/* The latest step's launches, in order. `launches` is engine-owned and valid until the next
+   sc_world_launches or sc_world_destroy on the same world. 16 bytes. */
+typedef struct ScLaunches {
+    const ScLaunch *SC_NULLABLE launches; /* NULL when count is 0 or the call failed. */
+    uint32_t count;
+    uint32_t _reserved;
+} ScLaunches;
+
 /* Opaque world handle. All calls on one handle must come from one thread at a time. */
 typedef struct ScWorld ScWorld;
 
@@ -301,6 +335,26 @@ bool sc_world_add_sensor(ScWorld *world, uint64_t unit_id, const ScSensor *SC_NU
    call, however many ticks it ran; empty before the first step and after a restore. Calling it
    again without stepping returns the same events. */
 ScEngagements sc_world_engagements(ScWorld *world);
+
+/* Standing orders (revision 1.5). The command node carries them out itself, so no link delay
+   applies; they act in every tick stepped, a long catch-up included, and are saved with the
+   world. At most SC_MAX_STANDING_ORDERS are active at once. */
+
+/* Adds a standing order, active from the end of the next tick run. Returns its id (from 1), or
+   0 if it is rejected: bad values, reserved fields or option bits, or SC_MAX_STANDING_ORDERS
+   already active. */
+uint64_t sc_world_add_standing_order(ScWorld *world, const ScStandingOrder *order);
+
+/* Cancels a standing order. Units it launched carry on. False if no such order is active. */
+bool sc_world_cancel_standing_order(ScWorld *world, uint64_t order_id);
+
+/* Launches an active order has left; UINT32_MAX if no such order is active. An order out of
+   stock stays active until cancelled. */
+uint32_t sc_world_standing_order_stock(ScWorld *world, uint64_t order_id);
+
+/* The launches by standing orders during the most recent sc_world_step call, however many
+   ticks it ran; empty before the first step and after a restore. */
+ScLaunches sc_world_launches(ScWorld *world);
 
 #if defined(__clang__)
 #pragma clang assume_nonnull end

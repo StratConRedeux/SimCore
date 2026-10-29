@@ -5,8 +5,8 @@
 //! ticks to run with [`Sim::step`] and read the result with [`Sim::frame`].
 //!
 //! Each tick runs, in order: command delivery, emitter duty cycles, observation, exposure, the
-//! detected flag, pursuit steering, move orders, movement, then engagement resolution. See
-//! `docs/rules.md`.
+//! detected flag, pursuit steering, move orders, movement, engagement resolution, then standing
+//! orders. See `docs/rules.md`.
 
 mod components;
 mod gameplay;
@@ -14,6 +14,7 @@ mod grid;
 mod orders;
 mod rng;
 mod snapshot;
+mod standing;
 mod terrain;
 
 use components::Gone;
@@ -29,6 +30,9 @@ pub use orders::{CommandError, Emcon, LinkRules, Order};
 pub use rng::Pcg32;
 pub use simcore_abi::{ScStatus, ScUnitView, TICKS_PER_SECOND};
 pub use snapshot::{SNAPSHOT_FORMAT_VERSION, SnapshotError};
+pub use standing::{
+    LaunchEvent, MAX_STANDING_ORDERS, StandingOrder, StandingOrderError, StandingOrderStatus,
+};
 pub use terrain::Terrain;
 
 use bevy_ecs::prelude::*;
@@ -37,6 +41,7 @@ use gameplay::{Engagements, IdIndex, Scratch};
 use orders::{CommandQueue, JammerQuery, Moves, Pending};
 use simcore_abi::{affiliation, flags};
 use simcore_rules::to_local_f32;
+use standing::{Active, ContactQuery, Launch, PursuitQuery, StandingOrders};
 
 /// Fixed timestep in seconds.
 pub const DT: f64 = 1.0 / TICKS_PER_SECOND as f64;
@@ -70,7 +75,7 @@ pub struct SimClock {
 }
 
 /// Everything needed to spawn one unit.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UnitSpec {
     pub kind: u16,
     pub affiliation: u8,
@@ -121,6 +126,10 @@ pub struct Sim {
     jammer_query: JammerQuery,
     status_query: QueryState<StatusQuery>,
     snapshot: Vec<u8>,
+    standing: StandingOrders,
+    contact_query: ContactQuery,
+    pursuit_query: PursuitQuery,
+    launch_plan: Vec<Launch>,
 }
 
 impl Sim {
@@ -181,6 +190,8 @@ impl Sim {
         let heat_query = world.query::<HeatQuery>();
         let jammer_query = world.query();
         let status_query = world.query::<StatusQuery>();
+        let contact_query = world.query();
+        let pursuit_query = world.query();
         // The seed drives engagement rolls.
         let engagements = Engagements::new(&mut world, seed);
 
@@ -198,6 +209,10 @@ impl Sim {
             jammer_query,
             status_query,
             snapshot: Vec::new(),
+            standing: StandingOrders::default(),
+            contact_query,
+            pursuit_query,
+            launch_plan: Vec::new(),
         }
     }
 
@@ -293,29 +308,15 @@ impl Sim {
         mut spec: UnitSpec,
         pursuer: Option<Pursuer>,
     ) -> Result<StableId, SpawnError> {
-        let finite = |v: [f64; 3]| v.iter().all(|c| c.is_finite());
-        let p = spec.position;
         let v = spec.velocity;
-        let unit_ok = finite([p.x, p.y, p.z])
-            && finite([v.x, v.y, v.z])
-            && spec.ems.erp_w >= 0.0
-            && spec.ems.erp_w.is_finite()
-            && spec.affiliation <= affiliation::NEUTRAL
-            && spec.kind != kind::COMMAND_NODE;
-        if !unit_ok {
+        if !unit_valid(&spec) || ![v.x, v.y, v.z].iter().all(|c| c.is_finite()) {
             return Err(SpawnError::InvalidUnit);
         }
         if let Some(cycle) = spec.cycle {
             spec.ems.emitting = cycle.is_on(self.tick());
         }
         if let Some(q) = pursuer {
-            let non_negative = |x: f64| x >= 0.0 && x.is_finite();
-            let ok = q.speed > 0.0
-                && q.speed.is_finite()
-                && non_negative(q.max_turn_rate)
-                && non_negative(q.engagement_radius_m)
-                && (0.0..=1.0).contains(&q.lead);
-            if !ok {
+            if !pursuit_valid(&q) {
                 return Err(SpawnError::InvalidPursuer);
             }
             if !self.contains(q.target) {
@@ -539,9 +540,11 @@ impl Sim {
 
     /// Advances the world by `ticks` fixed steps of [`DT`] seconds. `step(0)` runs no ticks.
     ///
-    /// Clears the engagement events, then collects those of every tick run.
+    /// Clears the engagement events and standing-order launches, then collects those of every
+    /// tick run.
     pub fn step(&mut self, ticks: u32) {
         self.engagements.events.clear();
+        self.standing.launches.clear();
         for _ in 0..ticks {
             let now = self.world.resource::<SimClock>().tick;
             self.commands.deliver(&mut self.world, now);
@@ -552,6 +555,10 @@ impl Sim {
             let origin = self.command_node_position();
             self.engagements.resolve(&mut self.world, tick, origin);
             self.world.resource_mut::<SimClock>().tick = tick;
+            // Launches spawn units, which needs `&mut self`, so standing orders come last too.
+            if self.standing.any_ready(tick) {
+                self.run_standing_orders(tick);
+            }
             // Despawns (in `despawn_removed`) log removed components in double-buffered queues
             // that only this clears. Once per tick keeps them bounded (and their capacity
             // reused).
@@ -565,6 +572,98 @@ impl Sim {
                 self.schedule.check_change_ticks(check);
             }
         }
+    }
+
+    /// Adds a standing order, active from the end of the next tick run, and returns its id
+    /// (from 1, in issue order). The command node carries it out itself, so no link delay
+    /// applies. Positions are as in [`StandingOrder`].
+    pub fn add_standing_order(&mut self, order: StandingOrder) -> Result<u64, StandingOrderError> {
+        standing_order_valid(&order)?;
+        if self.standing.active.len() >= MAX_STANDING_ORDERS {
+            return Err(StandingOrderError::TooMany);
+        }
+        // Kept without the fields a launch ignores, so a saved world's bytes are canonical.
+        let mut order = order;
+        order.launch.velocity = Velocity::default();
+        order.pursuer.target = StableId(0);
+        if order.launch.cycle.is_some() {
+            // The cycle decides at launch, as in `spawn`.
+            order.launch.ems.emitting = false;
+        }
+        self.standing.last_id = self.standing.last_id.saturating_add(1);
+        let id = self.standing.last_id;
+        self.standing.active.push(Active {
+            id,
+            order,
+            status: StandingOrderStatus {
+                remaining: order.stock,
+                ready_tick: 0,
+            },
+        });
+        Ok(id)
+    }
+
+    /// Cancels standing order `id`. Units it launched carry on. Returns `false` if there is no
+    /// such active order.
+    pub fn cancel_standing_order(&mut self, id: u64) -> bool {
+        let before = self.standing.active.len();
+        self.standing.active.retain(|a| a.id != id);
+        self.standing.active.len() != before
+    }
+
+    /// Standing order `id`'s progress, if it is active. An order with no stock left stays
+    /// active until cancelled.
+    pub fn standing_order(&self, id: u64) -> Option<StandingOrderStatus> {
+        self.standing
+            .active
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.status)
+    }
+
+    /// Active standing orders, in id order.
+    pub fn standing_orders(&self) -> impl Iterator<Item = (u64, &StandingOrder)> {
+        self.standing.active.iter().map(|a| (a.id, &a.order))
+    }
+
+    /// Launches by standing orders during the most recent [`Sim::step`] call, in order. The
+    /// buffer is reused across calls.
+    pub fn standing_order_launches(&self) -> &[LaunchEvent] {
+        &self.standing.launches
+    }
+
+    fn run_standing_orders(&mut self, tick: u64) {
+        let node = self.command_node_position();
+        let mut plan = std::mem::take(&mut self.launch_plan);
+        plan.clear();
+        self.standing.plan(
+            &self.world,
+            &mut self.contact_query,
+            &mut self.pursuit_query,
+            tick,
+            node,
+            &mut plan,
+        );
+        for l in plan.drain(..) {
+            match self.spawn(l.spec, Some(l.pursuer)) {
+                Ok(pursuer) => self.standing.launches.push(LaunchEvent {
+                    tick,
+                    order: l.order,
+                    pursuer,
+                    target: l.pursuer.target,
+                }),
+                // The order's values were checked when it was added and the heading is always
+                // finite, so only exhausted ids fail here. The launch did not happen: it is not
+                // charged, stock or cooldown. (Its target stays claimed for this tick, which
+                // costs nothing: with no ids left, no other launch can succeed either.)
+                Err(_) => {
+                    if let Some(a) = self.standing.active.iter_mut().find(|a| a.id == l.order) {
+                        a.status = l.before;
+                    }
+                }
+            }
+        }
+        self.launch_plan = plan;
     }
 
     /// Ticks run since creation.
@@ -630,6 +729,48 @@ impl Sim {
     pub fn world(&self) -> &World {
         &self.world
     }
+}
+
+/// [`Sim::spawn`]'s unit checks, except the velocity: a finite position, a non-negative finite
+/// power, a known affiliation, and not the command node's kind.
+fn unit_valid(spec: &UnitSpec) -> bool {
+    let p = spec.position;
+    [p.x, p.y, p.z].iter().all(|c| c.is_finite())
+        && spec.ems.erp_w >= 0.0
+        && spec.ems.erp_w.is_finite()
+        && spec.affiliation <= affiliation::NEUTRAL
+        && spec.kind != kind::COMMAND_NODE
+}
+
+/// [`Sim::spawn`]'s pursuit checks, except the target.
+fn pursuit_valid(q: &Pursuer) -> bool {
+    let non_negative = |x: f64| x >= 0.0 && x.is_finite();
+    q.speed > 0.0
+        && q.speed.is_finite()
+        && non_negative(q.max_turn_rate)
+        && non_negative(q.engagement_radius_m)
+        && (0.0..=1.0).contains(&q.lead)
+}
+
+/// Everything [`Sim::add_standing_order`] checks but the count.
+pub(crate) fn standing_order_valid(o: &StandingOrder) -> Result<(), StandingOrderError> {
+    let zone_ok = o.center_x.is_finite()
+        && o.center_y.is_finite()
+        && o.radius_m > 0.0
+        && o.radius_m.is_finite();
+    if !zone_ok {
+        return Err(StandingOrderError::InvalidZone);
+    }
+    if !unit_valid(&o.launch) || o.launch.affiliation != affiliation::FRIENDLY {
+        return Err(StandingOrderError::InvalidUnit);
+    }
+    if !pursuit_valid(&o.pursuer) {
+        return Err(StandingOrderError::InvalidPursuer);
+    }
+    if o.stock == u32::MAX {
+        return Err(StandingOrderError::InvalidStock);
+    }
+    Ok(())
 }
 
 /// Applies each emitter's duty cycle for the current tick. A silent unit ([`Emcon`]) stays off.

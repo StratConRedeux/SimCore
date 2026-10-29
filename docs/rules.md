@@ -24,6 +24,7 @@ Each tick of `DT = 1/15 s` runs, single-threaded and always in this order:
 7. **Move orders**: set moving units' velocities toward their destinations.
 8. **Movement**: explicit Euler, `position += velocity * DT`.
 9. **Engagement resolution**: swept checks, outcome rolls, removals.
+10. **Standing orders**: launches at detected hostiles (see Standing orders).
 
 ## Detection range
 
@@ -299,6 +300,57 @@ previews the delay; the status reports the delay at the command node itself.
 The jammer check scans the units once per call: commands and link-delay previews are per player
 action, not per tick.
 
+## Standing orders
+
+A standing order is a rule the command node carries out by itself, at the end of every tick,
+with no player input: it acts the same whether the caller steps one tick or a long catch-up.
+`Sim::add_standing_order(StandingOrder)` returns its id (from 1, in issue order); it takes effect
+from the end of the next tick run, with no link delay, since the node itself holds it. At most
+`MAX_STANDING_ORDERS` (64) are active at once.
+
+There is one kind: **engage detected hostiles in a zone**. `StandingOrder { center_x, center_y,
+radius_m, kinds, launch, pursuer, stock, cooldown_ticks }`:
+
+- The **zone** is a horizontal disc (world m; altitude does not matter). `kinds` is a bit mask
+  over kind codes, bit `k` for kind `k`; 0 matches every kind, and kinds from 32 up only match 0.
+- At the end of each tick, after engagement resolution, each order in id order that has
+  **stock** left and whose **cooldown** has passed picks a **contact**: a live hostile unit that
+  is **detected** (the frame's `DETECTED` flag, as of this tick), whose kind matches, whose
+  horizontal distance from the centre is at most the radius (inclusive), and that **no live
+  friendly pursuer is already after**, including the player's own strikes and this tick's
+  earlier launches. The nearest to the centre wins; ties go to the lower id, so the result never
+  depends on ECS order.
+- It **launches** one pursuer at it: `launch` placed at the command node's position plus
+  `launch.position`, heading straight at the contact at `pursuer.speed` (`launch.velocity` and
+  `pursuer.target` are ignored), and spawned with `Sim::spawn`'s checks. Pursuit steering takes
+  over on the next tick. One unit of stock is used, and the order can launch again on the tick
+  `cooldown_ticks` later (at least the next tick).
+- An order out of stock stays active until `Sim::cancel_standing_order(id)`. Cancelling does not
+  recall units already launched.
+
+`Sim::add_standing_order` rejects (`StandingOrderError`) a non-finite centre or a radius that is not
+positive and finite, a launch unit that fails `Sim::spawn`'s unit checks (velocity aside) or is
+not friendly, pursuit values `Sim::spawn` would reject, and stock of `u32::MAX` (the C API's "no
+such order"). The launch heading is always finite, so a launch can only fail if the world has
+used every id; it is then not charged, neither stock nor cooldown.
+
+`Sim::standing_order(id)` gives `StandingOrderStatus { remaining, ready_tick }`.
+`Sim::standing_order_launches()` returns the `LaunchEvent { tick, order, pursuer, target }`s of
+the most recent `step` call, in order; the launched unit's engagement later names it as the
+pursuer. Standing orders are saved with the world (snapshot format 2).
+
+Over the C API (revision 1.5), `sc_world_add_standing_order` takes an `ScStandingOrder`: the zone
+centre in metres relative to the command node at the call (then fixed in the world), and the
+launch unit as an `ScUnitSpec` with `SC_SPAWN_PURSUER` (not `SC_SPAWN_SENSOR`), positioned
+relative to the node at each launch. `sc_world_standing_order_stock` gives the remaining stock
+(`UINT32_MAX` for no such order, so stock is at most `UINT32_MAX - 1`), and `sc_world_launches`
+the `ScLaunch`es of the latest step.
+
+**Cost.** Orders cooling down or out of stock cost nothing. While any order is ready, each tick
+collects the detected hostiles in one pass over the units, plus the friendly pursuers' targets,
+then tests each contact against each ready order: ~0.3 ms for eight orders on the 50,000-unit
+benchmark. A launch spawns a unit, the only time `step` allocates.
+
 ## Status
 
 `Sim::status()` (`sc_world_status`) summarises live units for the HUD: tick, unit count, the
@@ -310,9 +362,10 @@ frame.
 ## Save and restore
 
 `Sim::save()` (`sc_world_save`) writes the whole world: clock, ids, the engagement PRNG, rules,
-link rules, terrain, every unit's components, moves in progress and queued commands. The format
+link rules, terrain, every unit's components, moves in progress, queued commands and standing
+orders. The format
 is versioned, little-endian and checksummed (FNV-1a 64); it is not meant to be read by anything
-but `Sim::restore`. Units are written in id order, so the bytes are canonical: saving a restored
+but `Sim::restore`. Format 2 added standing orders; a format-1 snapshot restores with none. Units are written in id order, so the bytes are canonical: saving a restored
 world gives the same bytes.
 
 `Sim::restore(bytes)` (`sc_world_restore`) gives a world that continues exactly as the saved one
@@ -320,7 +373,9 @@ would have: same frames (by id), events, rolls and status, tested over hundreds 
 commands on both. It rejects other formats, damaged bytes (any single-bit error is caught by the
 checksum) and impossible worlds (duplicate or out-of-range ids, no command node, invalid
 terrain, ticks or command ids at or above `2^62`, moves and queued commands that could never
-have been accepted, deliveries more than `u32::MAX` ticks away), and never panics: tested on every truncation and on 20,000 randomly tampered payloads
+have been accepted, deliveries more than `u32::MAX` ticks away, standing orders that could never
+have been added or that report more stock or cooldown than they could have), and never panics:
+tested on every truncation and on 20,000 randomly tampered payloads
 with the checksum recomputed. Ids are limited to below `2^24`, which bounds what a snapshot can
 make the engine allocate for its id index (8 bytes per id up to the largest: 128 MiB). A world
 that has spawned 16.7 million units cannot be restored; play spawns thousands. Restore time is

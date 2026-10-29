@@ -65,6 +65,15 @@ _Static_assert(offsetof(ScEngagement, target_kind) == 36, "engagement target_kin
 _Static_assert(offsetof(ScEngagement, target_affiliation) == 38, "target_affiliation");
 _Static_assert(offsetof(ScEngagement, flags) == 39, "engagement flags");
 _Static_assert(sizeof(ScEngagements) == 16, "ScEngagements size");
+_Static_assert(sizeof(ScStandingOrder) == 152, "ScStandingOrder size");
+_Static_assert(_Alignof(ScStandingOrder) == 8, "ScStandingOrder align");
+_Static_assert(offsetof(ScStandingOrder, radius_m) == 16, "radius_m");
+_Static_assert(offsetof(ScStandingOrder, kinds) == 24, "kinds");
+_Static_assert(offsetof(ScStandingOrder, cooldown_ticks) == 32, "cooldown_ticks");
+_Static_assert(offsetof(ScStandingOrder, launch) == 40, "launch");
+_Static_assert(sizeof(ScLaunch) == 32, "ScLaunch size");
+_Static_assert(offsetof(ScLaunch, pursuer_id) == 16, "launch pursuer_id");
+_Static_assert(sizeof(ScLaunches) == 16, "ScLaunches size");
 
 /* Every function, through a pointer of exactly the header's type. */
 static uint32_t (*const p_abi_version)(void) = sc_abi_version;
@@ -88,6 +97,13 @@ static bool (*const p_set_terrain)(ScWorld *, const ScTerrain *, const float *, 
 static uint64_t (*const p_spawn)(ScWorld *, const ScUnitSpec *) = sc_world_spawn;
 static bool (*const p_add_sensor)(ScWorld *, uint64_t, const ScSensor *) = sc_world_add_sensor;
 static ScEngagements (*const p_engagements)(ScWorld *) = sc_world_engagements;
+static uint64_t (*const p_add_standing_order)(ScWorld *, const ScStandingOrder *) =
+    sc_world_add_standing_order;
+static bool (*const p_cancel_standing_order)(ScWorld *, uint64_t) =
+    sc_world_cancel_standing_order;
+static uint32_t (*const p_standing_order_stock)(ScWorld *, uint64_t) =
+    sc_world_standing_order_stock;
+static ScLaunches (*const p_launches)(ScWorld *) = sc_world_launches;
 
 static int failures = 0;
 #define CHECK(cond)                                                                \
@@ -318,6 +334,65 @@ int main(void) {
     CHECK(p_engagements(g).count == 0);
     CHECK(p_engagements(NULL).count == 0 && p_engagements(NULL).events == NULL);
     p_destroy(g);
+
+    /* Revision 1.5: a standing order sees the radar and launches at it by itself. */
+    ScWorld *h = p_create(5);
+    CHECK(h != NULL);
+    CHECK(p_set_rules(h, &rules, table, 1));
+    CHECK(p_add_sensor(h, 1, NULL));
+    radar.x = 1500.0;
+    uint64_t target = p_spawn(h, &radar);
+    CHECK(target == 2);
+    ScStandingOrder sop = {.x = 1500.0, .radius_m = 400.0,
+                           .kinds = 1u << SC_KIND_GROUND_RADAR, .stock = 2,
+                           .cooldown_ticks = 30, .launch = strike};
+    sop.launch.target_id = 0;
+    sop.launch.z = 5.0;
+    ScStandingOrder bad_sop = sop;
+    bad_sop._reserved = 1;
+    CHECK(p_add_standing_order(h, &bad_sop) == 0);
+    bad_sop = sop;
+    bad_sop.launch.options = 0;
+    CHECK(p_add_standing_order(h, &bad_sop) == 0);
+    bad_sop = sop;
+    bad_sop.stock = UINT32_MAX;
+    CHECK(p_add_standing_order(h, &bad_sop) == 0);
+    bad_sop = sop;
+    bad_sop.radius_m = 0.0;
+    CHECK(p_add_standing_order(h, &bad_sop) == 0);
+    CHECK(p_add_standing_order(h, NULL) == 0);
+    uint64_t order = p_add_standing_order(h, &sop);
+    CHECK(order == 1);
+    CHECK(p_standing_order_stock(h, order) == 2);
+    CHECK(p_standing_order_stock(h, 99) == UINT32_MAX);
+    CHECK(p_launches(h).count == 0 && p_launches(h).launches == NULL);
+    /* Detected on tick 2 (the exposure threshold): the launch follows at the end of it. */
+    p_step(h, 10);
+    ScLaunches ls = p_launches(h);
+    CHECK(ls.count == 1 && ls.launches != NULL);
+    if (ls.count == 1) {
+        CHECK(ls.launches[0].tick == 2 && ls.launches[0].order_id == order);
+        CHECK(ls.launches[0].pursuer_id == 3 && ls.launches[0].target_id == target);
+    }
+    CHECK(p_standing_order_stock(h, order) == 1);
+    /* It strikes as a pursuer launched by hand would. */
+    uint32_t kills = 0;
+    for (int i = 0; i < 300 && kills == 0; i++) {
+        p_step(h, 1);
+        ScEngagements e = p_engagements(h);
+        for (uint32_t k = 0; k < e.count; k++) {
+            kills += e.events[k].pursuer_id == 3 && e.events[k].target_id == target;
+        }
+    }
+    CHECK(kills == 1);
+    CHECK(p_cancel_standing_order(h, order));
+    CHECK(!p_cancel_standing_order(h, order));
+    CHECK(p_standing_order_stock(h, order) == UINT32_MAX);
+    CHECK(p_add_standing_order(NULL, &sop) == 0);
+    CHECK(!p_cancel_standing_order(NULL, 1));
+    CHECK(p_standing_order_stock(NULL, 1) == UINT32_MAX);
+    CHECK(p_launches(NULL).count == 0 && p_launches(NULL).launches == NULL);
+    p_destroy(h);
 
     if (failures) {
         fprintf(stderr, "conformance: %d failure(s)\n", failures);

@@ -12,7 +12,7 @@ use simcore_abi::ScUnitView;
 use simcore_abi::affiliation::{FRIENDLY, HOSTILE, NEUTRAL};
 use simcore_engine::{
     EmsProfile, HeatmapSpec, OutcomeTable, Pcg32, Position, Pursuer, Rules, Sensor, SensorParams,
-    Sim, StableId, Terrain, UnitSpec, Velocity, kind,
+    Sim, StableId, StandingOrder, Terrain, UnitSpec, Velocity, kind,
 };
 
 struct Counting;
@@ -256,6 +256,44 @@ fn bench_worst_cases(units: u32) {
         "  rules scenario {:.3} ms; with one far sensor per side at (1e7, 1e7) m {:.3} ms",
         median(time_steps(&mut base, 50)),
         median(time_steps(&mut outliers, 50))
+    );
+
+    // Standing orders that are always ready but find nothing: each tick scans every unit for
+    // detected hostiles, and the zones (far away) match none.
+    let mut idle = rules_scenario(units);
+    for i in 0..8 {
+        idle.add_standing_order(StandingOrder {
+            center_x: 1e6 + f64::from(i),
+            center_y: 0.0,
+            radius_m: 5_000.0,
+            kinds: 0,
+            launch: UnitSpec {
+                kind: kind::FIXED_WING_DRONE,
+                affiliation: FRIENDLY,
+                position: Position::default(),
+                velocity: Velocity::default(),
+                ems: EmsProfile::default(),
+                cycle: None,
+            },
+            pursuer: Pursuer {
+                target: StableId(0),
+                speed: 100.0,
+                max_turn_rate: 1.0,
+                lead: 0.0,
+                engagement_radius_m: 10.0,
+                outcome_class: 0,
+            },
+            stock: 1_000_000,
+            cooldown_ticks: 0,
+        })
+        .expect("valid order");
+    }
+    idle.step(1);
+    base.step(1);
+    println!(
+        "  rules scenario {:.3} ms; with 8 ready standing orders that find nothing {:.3} ms",
+        median(time_steps(&mut base, 50)),
+        median(time_steps(&mut idle, 50))
     );
 
     // 20,000 hostile emitters in a 2 km disc, mapped from the middle of the cluster.

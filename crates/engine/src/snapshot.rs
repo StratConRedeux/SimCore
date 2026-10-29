@@ -5,7 +5,8 @@
 //!
 //! ```text
 //! header:  b"SCSN"  format_version u32  payload_len u64  fnv1a64(payload) u64
-//! payload: clock, ids, counters, PRNG; Rules; LinkRules; Terrain; units; moves; pending commands
+//! payload: clock, ids, counters, PRNG; Rules; LinkRules; Terrain; units; moves; pending commands;
+//!          standing orders (format 2 on)
 //! ```
 //!
 //! Units are written in stable id order, so the bytes are canonical: saving a restored world
@@ -17,15 +18,17 @@ use bevy_ecs::prelude::*;
 
 use crate::gameplay::{IdIndex, Scratch};
 use crate::orders::{Move, Moves, Pending};
+use crate::standing::Active;
 use crate::{
     Affiliation, CommandNode, Detected, Emcon, EmitterCycle, EmsProfile, Exposure, Gone, LinkRules,
-    Order, OutcomeTable, Position, Pursuer, Rules, Sensor, SensorParams, Sim, SimClock, StableId,
-    Terrain, UnitKind, Velocity,
+    MAX_STANDING_ORDERS, Order, OutcomeTable, Position, Pursuer, Rules, Sensor, SensorParams, Sim,
+    SimClock, StableId, StandingOrder, StandingOrderStatus, Terrain, UnitKind, UnitSpec, Velocity,
 };
 
-/// Bumped whenever the payload layout changes. Older formats are rejected, not migrated, until
-/// a release needs to read them.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+/// Bumped whenever the payload layout changes. Format 2 added standing orders; format 1, which
+/// is format 2 without them, still restores (with none). Older formats are rejected, not
+/// migrated, until a release needs to read them.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
 
 const MAGIC: &[u8; 4] = b"SCSN";
 const HEADER_LEN: usize = 4 + 4 + 8 + 8;
@@ -73,6 +76,10 @@ const U_SENSOR_PARAMS: u8 = 1 << 4;
 const U_EMITTING: u8 = 1 << 5;
 const U_DETECTED: u8 = 1 << 6;
 const U_OBSERVED: u8 = 1 << 7;
+
+// Standing-order launch unit bits.
+const L_EMITTING: u8 = 1 << 0;
+const L_CYCLE: u8 = 1 << 1;
 
 // Order tags.
 const O_MOVE: u8 = 1;
@@ -335,6 +342,43 @@ impl Sim {
                 }
             }
         }
+
+        w.u64(self.standing.last_id);
+        w.len(self.standing.active.len());
+        for a in &self.standing.active {
+            let (o, l, q) = (&a.order, &a.order.launch, &a.order.pursuer);
+            w.u64(a.id);
+            w.f64(o.center_x);
+            w.f64(o.center_y);
+            w.f64(o.radius_m);
+            w.u32(o.kinds);
+            w.u32(o.stock);
+            w.u32(o.cooldown_ticks);
+            w.u32(a.status.remaining);
+            w.u64(a.status.ready_tick);
+            w.u16(l.kind);
+            w.u8(l.affiliation);
+            let mut bits = 0;
+            if l.ems.emitting {
+                bits |= L_EMITTING;
+            }
+            if l.cycle.is_some() {
+                bits |= L_CYCLE;
+            }
+            w.u8(bits);
+            w.pos(l.position.x, l.position.y, l.position.z);
+            w.f32(l.ems.erp_w);
+            if let Some(c) = l.cycle {
+                w.u32(c.on_ticks);
+                w.u32(c.off_ticks);
+                w.u32(c.phase);
+            }
+            w.f64(q.speed);
+            w.f64(q.max_turn_rate);
+            w.f64(q.lead);
+            w.f64(q.engagement_radius_m);
+            w.u16(q.outcome_class);
+        }
     }
 
     /// Rebuilds a world from [`Sim::save`] output. It continues exactly as the saved world
@@ -347,7 +391,7 @@ impl Sim {
         let mut h = R(&bytes[4..HEADER_LEN]);
         let version = h.u32()?;
         let (payload_len, sum) = (h.u64()?, h.u64()?);
-        if version != SNAPSHOT_FORMAT_VERSION {
+        if !(1..=SNAPSHOT_FORMAT_VERSION).contains(&version) {
             return Err(SnapshotError::UnsupportedVersion(version));
         }
         let payload = &bytes[HEADER_LEN..];
@@ -358,7 +402,10 @@ impl Sim {
             return Err(SnapshotError::Corrupt);
         }
         let mut r = R(payload);
-        let sim = read_payload(&mut r)?;
+        let mut sim = read_payload(&mut r)?;
+        if version >= 2 {
+            read_standing_orders(&mut r, &mut sim)?;
+        }
         if !r.0.is_empty() {
             return Err(SnapshotError::Invalid("trailing bytes"));
         }
@@ -643,4 +690,91 @@ fn read_payload(r: &mut R) -> Parsed<Sim> {
     }
     sim.commands.pending = pending;
     Ok(sim)
+}
+
+const STANDING_ORDER_MIN_BYTES: usize = 8 + 24 + 16 + 8 + 4 + 24 + 4 + 32 + 2;
+
+fn read_standing_orders(r: &mut R, sim: &mut Sim) -> Parsed<()> {
+    let last_id = r.u64()?;
+    if last_id > MAX_COUNTER {
+        return Err(SnapshotError::Invalid("standing order id"));
+    }
+    let n = r.len(STANDING_ORDER_MIN_BYTES, "standing order count")?;
+    if n > MAX_STANDING_ORDERS {
+        return Err(SnapshotError::Invalid("standing order count"));
+    }
+    let tick = sim.tick();
+    let mut active: Vec<Active> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let id = r.u64()?;
+        let (center_x, center_y, radius_m) = (r.f64()?, r.f64()?, r.f64()?);
+        let (kinds, stock, cooldown_ticks, remaining) = (r.u32()?, r.u32()?, r.u32()?, r.u32()?);
+        let ready_tick = r.u64()?;
+        let (kind, affiliation, bits) = (r.u16()?, r.u8()?, r.u8()?);
+        if bits & !(L_EMITTING | L_CYCLE) != 0 || bits == L_EMITTING | L_CYCLE {
+            return Err(SnapshotError::Invalid("standing order launch"));
+        }
+        let position = r.pos()?;
+        let erp_w = r.f32()?;
+        let cycle = (bits & L_CYCLE != 0)
+            .then(|| -> Parsed<_> {
+                Ok(EmitterCycle {
+                    on_ticks: r.u32()?,
+                    off_ticks: r.u32()?,
+                    phase: r.u32()?,
+                })
+            })
+            .transpose()?;
+        let pursuer = Pursuer {
+            target: StableId(0),
+            speed: r.f64()?,
+            max_turn_rate: r.f64()?,
+            lead: r.f64()?,
+            engagement_radius_m: r.f64()?,
+            outcome_class: r.u16()?,
+        };
+        let order = StandingOrder {
+            center_x,
+            center_y,
+            radius_m,
+            kinds,
+            launch: UnitSpec {
+                kind,
+                affiliation,
+                position,
+                velocity: Velocity::default(),
+                ems: EmsProfile {
+                    emitting: bits & L_EMITTING != 0,
+                    erp_w,
+                },
+                cycle,
+            },
+            pursuer,
+            stock,
+            cooldown_ticks,
+        };
+        // Strictly increasing ids, as the list keeps them; a cooldown never reaches further
+        // than one cooldown past the saved tick.
+        let in_order = active.last().is_none_or(|a| a.id < id);
+        let ready_ok = ready_tick <= tick.saturating_add(u64::from(cooldown_ticks.max(1)));
+        if !in_order
+            || !(1..=last_id).contains(&id)
+            || remaining > stock
+            || !ready_ok
+            || crate::standing_order_valid(&order).is_err()
+        {
+            return Err(SnapshotError::Invalid("standing orders"));
+        }
+        active.push(Active {
+            id,
+            order,
+            status: StandingOrderStatus {
+                remaining,
+                ready_tick,
+            },
+        });
+    }
+    sim.standing.last_id = last_id;
+    sim.standing.active = active;
+    Ok(())
 }

@@ -271,3 +271,55 @@ private enum Environment {
         #expect(world.engagements.isEmpty, "only the latest step's events")
     }
 }
+
+@Suite struct ContractRevision15Tests {
+    @Test func standingOrderLayoutMatchesHeader() {
+        #expect(MemoryLayout<ScStandingOrder>.size == 152)
+        #expect(MemoryLayout<ScStandingOrder>.offset(of: \.launch) == 40)
+        #expect(MemoryLayout<ScLaunch>.size == 32)
+        #expect(MemoryLayout<ScLaunches>.size == 16)
+        #expect(SimWorld.maxStandingOrders == 64)
+    }
+
+    @Test func aStandingOrderLaunchesByItselfAndSurvivesARestore() throws {
+        let world = try #require(SimWorld(seed: 3))
+        var rules = ScRules()
+        (rules.detection_max_range_m, rules.sensor_base_range_m) = (20_000, 20_000)
+        (rules.sensor_reference_power_w, rules.exposure_threshold_ticks) = (1, 1)
+        (rules.exposure_cap_ticks, rules.exposure_decay_per_tick) = (1, 1)
+        #expect(world.setRules(rules))
+        #expect(world.addSensor(unit: 1))
+        var radar = ScUnitSpec()
+        (radar.x, radar.erp_w, radar.kind) = (3_000, 100, UInt16(SC_KIND_GROUND_RADAR))
+        (radar.affiliation, radar.options) = (SimWorld.affiliationHostile, SimWorld.spawnEmitting)
+        let target = try #require(world.spawn(radar))
+
+        var order = ScStandingOrder()
+        (order.x, order.radius_m, order.stock, order.cooldown_ticks) = (3_000, 500, 2, 30)
+        order.kinds = 1 << UInt32(SC_KIND_GROUND_RADAR)
+        order.launch.kind = UInt16(SC_KIND_FIXED_WING_DRONE)
+        (order.launch.affiliation, order.launch.options) = (SimWorld.affiliationFriendly, SimWorld.spawnPursuer)
+        (order.launch.speed_mps, order.launch.max_turn_rate_rad_s, order.launch.engagement_radius_m) = (100, 1, 10)
+        var sensor = order
+        sensor.launch.options |= SimWorld.spawnSensor
+        #expect(world.addStandingOrder(sensor) == nil)
+        let id = try #require(world.addStandingOrder(order))
+        #expect(world.standingOrderStock(id) == 2)
+        #expect(world.launches.isEmpty)
+
+        world.step()
+        let l = try #require(world.launches.first)
+        #expect((l.tick, l.order_id, l.target_id) == (1, id, target))
+        #expect(world.standingOrderStock(id) == 1)
+
+        let restored = try #require(SimWorld(snapshot: world.save()))
+        #expect(restored.standingOrderStock(id) == 1)
+        #expect(restored.launches.isEmpty)
+        world.step(100)
+        restored.step(100)
+        #expect(world.engagements.map(\.pursuer_id) == restored.engagements.map(\.pursuer_id))
+        #expect(world.cancelStandingOrder(id))
+        #expect(world.standingOrderStock(id) == nil)
+        #expect(!world.cancelStandingOrder(id))
+    }
+}

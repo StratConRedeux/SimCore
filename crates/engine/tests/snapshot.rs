@@ -4,9 +4,9 @@
 use simcore_abi::ScUnitView;
 use simcore_abi::affiliation::{FRIENDLY, HOSTILE};
 use simcore_engine::{
-    EmsProfile, LinkRules, Order, OutcomeTable, Pcg32, Position, Pursuer, Rules,
-    SNAPSHOT_FORMAT_VERSION, Sensor, SensorParams, Sim, SnapshotError, StableId, Terrain, UnitSpec,
-    Velocity, kind,
+    EmitterCycle, EmsProfile, LinkRules, Order, OutcomeTable, Pcg32, Position, Pursuer, Rules,
+    SNAPSHOT_FORMAT_VERSION, Sensor, SensorParams, Sim, SnapshotError, StableId, StandingOrder,
+    Terrain, UnitSpec, Velocity, kind,
 };
 
 fn p(x: f64, y: f64, z: f64) -> Position {
@@ -108,6 +108,38 @@ fn scenario(seed: u64) -> Sim {
             },
         );
     }
+    // Standing orders over the dummy area, one with an emitting, duty-cycled launch unit.
+    for (i, (x, y)) in [(-20_000.0, 0.0), (15_000.0, 10_000.0), (0.0, -25_000.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut launch = unit(FRIENDLY, kind::QUADCOPTER, p(0.0, 0.0, 30.0), 2.0);
+        if i == 1 {
+            launch.cycle = Some(EmitterCycle {
+                on_ticks: 4,
+                off_ticks: 9,
+                phase: 2,
+            });
+        }
+        sim.add_standing_order(StandingOrder {
+            center_x: x,
+            center_y: y,
+            radius_m: 12_000.0,
+            kinds: if i == 2 { 1 << kind::GROUND_RADAR } else { 0 },
+            launch,
+            pursuer: Pursuer {
+                target: StableId(0),
+                speed: 140.0,
+                max_turn_rate: 1.2,
+                lead: 0.4,
+                engagement_radius_m: 15.0,
+                outcome_class: 1,
+            },
+            stock: 40,
+            cooldown_ticks: 11 + 5 * i as u32,
+        })
+        .unwrap();
+    }
     sim
 }
 
@@ -142,11 +174,12 @@ fn orders(sim: &mut Sim, rng: &mut Pcg32) {
 fn restored_world_continues_identically() {
     let mut a = scenario(11);
     let mut rng = Pcg32::new(11, 3);
-    let mut engagements = 0;
+    let (mut engagements, mut launched) = (0, 0);
     for _ in 0..8 {
         orders(&mut a, &mut rng);
         a.step(25);
         engagements += a.engagement_events().len();
+        launched += a.standing_order_launches().len();
     }
     orders(&mut a, &mut rng);
     a.step(1);
@@ -155,6 +188,7 @@ fn restored_world_continues_identically() {
         engagements > 0,
         "the scenario removes units before the save"
     );
+    assert!(launched > 0, "standing orders launch before the save");
     assert!(
         before.pending_commands > 0,
         "commands are in flight at the save"
@@ -176,11 +210,15 @@ fn restored_world_continues_identically() {
 
     let (s_a, s_b) = (a.status(), b.status());
     assert_eq!(s_a, s_b);
+    for (id, _) in a.standing_orders() {
+        assert_eq!(a.standing_order(id), b.standing_order(id));
+    }
+    assert_eq!(a.standing_orders().count(), b.standing_orders().count());
     assert!(bits(a.frame()) == bits(b.frame()));
 
     // Both continue under the same new commands, tick by tick.
     let (mut ra, mut rb) = (Pcg32::new(5, 5), Pcg32::new(5, 5));
-    let mut events = 0;
+    let (mut events, mut launches) = (0, 0);
     for chunk in 0..30 {
         if chunk % 3 == 0 {
             orders(&mut a, &mut ra);
@@ -190,17 +228,20 @@ fn restored_world_continues_identically() {
             a.step(1);
             b.step(1);
             assert_eq!(a.engagement_events(), b.engagement_events());
+            assert_eq!(a.standing_order_launches(), b.standing_order_launches());
             events += a.engagement_events().len();
+            launches += a.standing_order_launches().len();
         }
         assert_eq!(a.status(), b.status(), "chunk {chunk}");
         assert!(bits(a.frame()) == bits(b.frame()), "chunk {chunk}");
     }
     println!(
-        "after restore: {events} engagements, {} units, {:?}",
+        "after restore: {events} engagements, {launches} launches, {} units, {:?}",
         a.unit_count(),
         a.status()
     );
     assert!(events > 0);
+    assert!(launches > 0);
 }
 
 #[test]
@@ -246,7 +287,92 @@ fn small_world() -> Vec<u8> {
     );
     sim.command(m, Order::Emissions { radiate: false }).unwrap();
     sim.command(StableId(1), Order::Halt).unwrap();
+    sim.add_standing_order(small_order()).unwrap();
+    let mut o = small_order();
+    o.launch.cycle = Some(EmitterCycle {
+        on_ticks: 2,
+        off_ticks: 3,
+        phase: 1,
+    });
+    let cancelled = sim.add_standing_order(o).unwrap();
+    sim.add_standing_order(o).unwrap();
+    sim.cancel_standing_order(cancelled);
     sim.save().to_vec()
+}
+
+fn small_order() -> StandingOrder {
+    StandingOrder {
+        center_x: 5.0,
+        center_y: 5.0,
+        radius_m: 50.0,
+        kinds: 1 << kind::GROUND_RADAR,
+        launch: unit(FRIENDLY, kind::QUADCOPTER, p(0.0, 0.0, 5.0), 1.0),
+        pursuer: Pursuer {
+            target: StableId(0),
+            speed: 3.0,
+            max_turn_rate: 1.0,
+            lead: 0.0,
+            engagement_radius_m: 1.0,
+            outcome_class: 0,
+        },
+        stock: 4,
+        cooldown_ticks: 9,
+    }
+}
+
+#[test]
+fn format_1_snapshots_restore_with_no_standing_orders() {
+    // Format 1 is format 2 without the trailing standing-order section: an empty one is the
+    // last id (8 bytes) and a count (4 bytes).
+    let mut sim = Sim::new_dummy(4, 50);
+    sim.step(20);
+    let v2 = sim.save().to_vec();
+    let mut v1 = v2[..v2.len() - 12].to_vec();
+    v1[4..8].copy_from_slice(&1u32.to_le_bytes());
+    let payload_len = (v1.len() - 24) as u64;
+    v1[8..16].copy_from_slice(&payload_len.to_le_bytes());
+    reseal(&mut v1);
+    let mut restored = Sim::restore(&v1).expect("format 1 restores");
+    assert_eq!(restored.save(), &v2[..], "and saves as format 2");
+    assert_eq!(restored.standing_orders().count(), 0);
+
+    // A format-1 header on format-2 bytes leaves the section over.
+    let mut v = v2.clone();
+    v[4..8].copy_from_slice(&1u32.to_le_bytes());
+    reseal(&mut v);
+    assert_eq!(
+        Sim::restore(&v).err(),
+        Some(SnapshotError::Invalid("trailing bytes"))
+    );
+}
+
+#[test]
+fn impossible_standing_orders_are_rejected() {
+    // The standing-order section is last; the last order's fields end the payload:
+    // ..., speed, turn, lead, radius (f64 each), outcome class (u16).
+    let good = small_world();
+    let n = good.len();
+    let restored = Sim::restore(&good).unwrap();
+    assert_eq!(
+        restored
+            .standing_orders()
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>(),
+        [1, 3]
+    );
+    let speed_at = n - 2 - 4 * 8;
+    for (at, bytes, what) in [
+        (speed_at, 0f64.to_le_bytes().to_vec(), "launch speed"),
+        (speed_at + 16, 2f64.to_le_bytes().to_vec(), "launch lead"),
+    ] {
+        let mut v = good.clone();
+        v[at..at + bytes.len()].copy_from_slice(&bytes);
+        reseal(&mut v);
+        assert!(
+            matches!(Sim::restore(&v), Err(SnapshotError::Invalid(_))),
+            "{what}"
+        );
+    }
 }
 
 #[test]

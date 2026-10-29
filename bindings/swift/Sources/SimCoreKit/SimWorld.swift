@@ -232,3 +232,45 @@ extension SimWorld {
         return Array(UnsafeBufferPointer(start: events, count: Int(e.count)))
     }
 }
+
+// MARK: - Contract revision 1.5: standing orders
+
+extension SimWorld {
+    public static let maxStandingOrders: UInt32 = SC_MAX_STANDING_ORDERS
+
+    /// Adds a standing order: engage detected hostiles in a zone with `order.launch`, which
+    /// must be a friendly pursuer (`spawnPursuer`, not `spawnSensor`). The zone centre is
+    /// relative to the command node now; the launch point is relative to it at each launch.
+    /// Returns the order's id, or `nil` if the engine rejects it or `maxStandingOrders` are
+    /// active.
+    public func addStandingOrder(_ order: ScStandingOrder) -> UInt64? {
+        precondition(!readingFrame, "SimWorld.addStandingOrder called inside withFrame")
+        var o = order
+        let id = sc_world_add_standing_order(handle, &o)
+        return id == 0 ? nil : id
+    }
+
+    /// Cancels a standing order; units it launched carry on. `false` if no such order is
+    /// active.
+    @discardableResult
+    public func cancelStandingOrder(_ id: UInt64) -> Bool {
+        precondition(!readingFrame, "SimWorld.cancelStandingOrder called inside withFrame")
+        return sc_world_cancel_standing_order(handle, id)
+    }
+
+    /// Launches an active standing order has left; `nil` if no such order is active.
+    public func standingOrderStock(_ id: UInt64) -> UInt32? {
+        let n = sc_world_standing_order_stock(handle, id)
+        return n == UInt32.max ? nil : n
+    }
+
+    /// The launches by standing orders during the most recent `step`, however many ticks it
+    /// ran, in order. Empty before the first step and after a restore. Copied out of the
+    /// engine; an empty result does not allocate.
+    public var launches: [ScLaunch] {
+        // Its own buffer, separate from the frame's, so this is safe inside `withFrame`.
+        let l = sc_world_launches(handle)
+        guard let launches = l.launches, l.count > 0 else { return [] }
+        return Array(UnsafeBufferPointer(start: launches, count: Int(l.count)))
+    }
+}

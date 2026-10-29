@@ -65,6 +65,7 @@ Layouts outside the main scenario, chosen to hit the cost bounds in `docs/rules.
 | 2 km cluster, 1,000 x 10,000, blocked | ~49 ms (flat: ~0.12 ms) |
 | 2 km cluster, 2,000 x 20,000, blocked | ~197 ms (flat: ~0.23 ms) |
 | Rules scenario plus one sensor per side at (1e7, 1e7) m | ~2.0 ms (without: ~1.67 ms) |
+| Rules scenario plus 8 standing orders, always ready, whose zones hold nothing | ~1.88 ms (without: ~1.59 ms) |
 | Heatmap 128 x 128, 50 m cells, 8 km cutoff, 20,000 emitters in a 2 km disc, exact | ~194 ms |
 | Same, far field (`theta = 2`) | ~6.3 ms (worst cell 0.05% off; 0.021% of the max) |
 | Heatmap 512 x 512, same emitters, exact | ~1,064 ms |
@@ -76,6 +77,11 @@ stops at the first sensor that observes it, so the cost is near linear while sen
 When nothing observes and units are packed into a few cells, every emitter tests every sensor:
 the blocked clusters above grow 4x when both counts double (`emitters x sensors`). There is no
 work cap; avoid large, dense groups of mutually hidden sensors and emitters.
+
+A ready standing order (stock left, cooldown over) costs a pass over the units every tick to
+collect detected hostiles, then a distance test per contact per ready order: ~0.3 ms here, with
+thousands of detected hostiles and eight orders. Orders that are cooling down or out of stock
+cost nothing. A launch spawns a unit, the one time a tick allocates.
 
 The grid's cell size is fixed at half the max range. A far outlier switches it to a sorted layout
 (binary search per row) instead of coarsening the cells, which costs ~20% here rather than

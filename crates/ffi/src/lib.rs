@@ -1,8 +1,9 @@
 //! C API for SimCore. Implements `include/simcore.h` exactly; see `docs/ffi-contract.md`.
 //!
 //! Every export:
-//! - accepts a NULL handle and returns a safe default (NULL, 0, `UINT32_MAX` for a link delay,
-//!   or an empty [`ScFrame`], [`ScEngagements`], [`ScStatus`] or [`ScBytes`]);
+//! - accepts a NULL handle and returns a safe default (NULL, 0, `false`, `UINT32_MAX` for a link
+//!   delay or a standing order's stock, or an empty [`ScFrame`], [`ScEngagements`],
+//!   [`ScLaunches`], [`ScStatus`] or [`ScBytes`]);
 //! - catches unwinding, so no panic crosses the boundary. Release builds use `panic = "abort"`,
 //!   where a panic aborts the process instead; that is also defined behaviour.
 //!
@@ -12,13 +13,13 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub use simcore_abi::{
-    ABI_VERSION, ScBytes, ScCommand, ScEngagement, ScEngagements, ScFrame, ScLinkRules, ScOutcome,
-    ScRules, ScSensor, ScStatus, ScTerrain, ScUnitSpec, ScUnitView, TICKS_PER_SECOND, command,
-    engagement, kind, spawn,
+    ABI_VERSION, MAX_STANDING_ORDERS, ScBytes, ScCommand, ScEngagement, ScEngagements, ScFrame,
+    ScLaunch, ScLaunches, ScLinkRules, ScOutcome, ScRules, ScSensor, ScStandingOrder, ScStatus,
+    ScTerrain, ScUnitSpec, ScUnitView, TICKS_PER_SECOND, command, engagement, kind, spawn,
 };
 use simcore_engine::{
     EmitterCycle, EmsProfile, LinkRules, Order, OutcomeTable, Position, Pursuer, Rules, Sensor,
-    SensorParams, Sim, StableId, Terrain, UnitSpec, Velocity,
+    SensorParams, Sim, StableId, StandingOrder, Terrain, UnitSpec, Velocity,
 };
 
 /// Opaque world handle (`ScWorld` in the header). C only ever sees a pointer to it.
@@ -26,6 +27,8 @@ pub struct ScWorld {
     sim: Sim,
     /// The latest step's engagements in C layout, rebuilt by `sc_world_engagements`.
     engagements: Vec<ScEngagement>,
+    /// The latest step's standing-order launches in C layout, rebuilt by `sc_world_launches`.
+    launches: Vec<ScLaunch>,
 }
 
 /// The frame returned on a NULL handle or a failure: null pointer, count 0, tick 0.
@@ -54,6 +57,7 @@ fn into_handle(sim: Sim) -> *mut ScWorld {
     Box::into_raw(Box::new(ScWorld {
         sim,
         engagements: Vec::new(),
+        launches: Vec::new(),
     }))
 }
 
@@ -641,6 +645,145 @@ pub unsafe extern "C" fn sc_world_add_sensor(
     guard(false, || w.sim.add_sensor(StableId(unit_id), sensor))
 }
 
+/// Converts a C standing order, resolving the zone centre relative to the command node. `None`
+/// for a set reserved field, or a launch that is not a pursuer, is a sensor or fails
+/// [`unit_spec`]; [`Sim::add_standing_order`] checks the values.
+fn standing_order(sim: &Sim, o: &ScStandingOrder) -> Option<StandingOrder> {
+    let l = &o.launch;
+    if o._reserved != 0 || l.options & spawn::PURSUER == 0 || l.options & spawn::SENSOR != 0 {
+        return None;
+    }
+    let (mut launch, pursuer) = unit_spec(sim, l)?;
+    // Relative to the node at each launch, not now: undo the conversion `unit_spec` applies.
+    launch.position = Position {
+        x: l.x,
+        y: l.y,
+        z: l.z,
+    };
+    let n = node(sim);
+    Some(StandingOrder {
+        center_x: n.x + o.x,
+        center_y: n.y + o.y,
+        radius_m: o.radius_m,
+        kinds: o.kinds,
+        launch,
+        pursuer: pursuer?,
+        stock: o.stock,
+        cooldown_ticks: o.cooldown_ticks,
+    })
+}
+
+/// `uint64_t sc_world_add_standing_order(ScWorld *world, const ScStandingOrder *order);`
+/// Returns the order's id (from 1), or 0, with nothing changed, on NULL, a rejected order, a
+/// full list or failure.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread; `order` is
+/// NULL or points to a readable `ScStandingOrder`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_add_standing_order(
+    world: *mut ScWorld,
+    order: *const ScStandingOrder,
+) -> u64 {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return 0;
+    };
+    // SAFETY: NULL or a readable ScStandingOrder (caller contract). Copied out at once.
+    let Some(o) = (unsafe { order.as_ref() }).copied() else {
+        return 0;
+    };
+    guard(0, || {
+        standing_order(&w.sim, &o)
+            .and_then(|o| w.sim.add_standing_order(o).ok())
+            .unwrap_or(0)
+    })
+}
+
+/// `bool sc_world_cancel_standing_order(ScWorld *world, uint64_t order_id);` False on NULL, an
+/// unknown order or failure.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_cancel_standing_order(
+    world: *mut ScWorld,
+    order_id: u64,
+) -> bool {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return false;
+    };
+    guard(false, || w.sim.cancel_standing_order(order_id))
+}
+
+/// `uint32_t sc_world_standing_order_stock(ScWorld *world, uint64_t order_id);` `UINT32_MAX` on
+/// NULL, an unknown order or failure; stock never reaches it.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_standing_order_stock(world: *mut ScWorld, order_id: u64) -> u32 {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return u32::MAX;
+    };
+    guard(u32::MAX, || {
+        w.sim
+            .standing_order(order_id)
+            .map_or(u32::MAX, |s| s.remaining)
+    })
+}
+
+/// The launches returned on a NULL handle or a failure: null pointer, count 0.
+pub const fn empty_launches() -> ScLaunches {
+    ScLaunches {
+        launches: std::ptr::null(),
+        count: 0,
+        _reserved: 0,
+    }
+}
+
+/// `ScLaunches sc_world_launches(ScWorld *world);` Returns [`empty_launches`] on NULL or
+/// failure.
+///
+/// The standing-order launches during the most recent `sc_world_step`, in order. The returned
+/// `launches` points into a buffer the handle reuses and stays valid until the next
+/// `sc_world_launches` or `sc_world_destroy` on this handle.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_launches(world: *mut ScWorld) -> ScLaunches {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return empty_launches();
+    };
+    guard(empty_launches(), || {
+        w.launches.clear();
+        w.launches
+            .extend(w.sim.standing_order_launches().iter().map(|l| ScLaunch {
+                tick: l.tick,
+                order_id: l.order,
+                pursuer_id: l.pursuer.0,
+                target_id: l.target.0,
+            }));
+        let Ok(count) = u32::try_from(w.launches.len()) else {
+            return empty_launches();
+        };
+        ScLaunches {
+            // An empty slice's pointer is dangling; the contract says NULL for "none".
+            launches: if count == 0 {
+                std::ptr::null()
+            } else {
+                w.launches.as_ptr()
+            },
+            count,
+            _reserved: 0,
+        }
+    })
+}
+
 /// The exports with the exact C signatures from `include/simcore.h`. If a signature drifts,
 /// this stops compiling.
 const _: () = {
@@ -665,6 +808,11 @@ const _: () = {
     let _: unsafe extern "C" fn(*mut ScWorld, *const ScUnitSpec) -> u64 = sc_world_spawn;
     let _: unsafe extern "C" fn(*mut ScWorld, u64, *const ScSensor) -> bool = sc_world_add_sensor;
     let _: unsafe extern "C" fn(*mut ScWorld) -> ScEngagements = sc_world_engagements;
+    let _: unsafe extern "C" fn(*mut ScWorld, *const ScStandingOrder) -> u64 =
+        sc_world_add_standing_order;
+    let _: unsafe extern "C" fn(*mut ScWorld, u64) -> bool = sc_world_cancel_standing_order;
+    let _: unsafe extern "C" fn(*mut ScWorld, u64) -> u32 = sc_world_standing_order_stock;
+    let _: unsafe extern "C" fn(*mut ScWorld) -> ScLaunches = sc_world_launches;
 };
 
 #[cfg(test)]
@@ -685,6 +833,18 @@ mod tests {
             let e = sc_world_engagements(std::ptr::null_mut());
             assert!(e.events.is_null());
             assert_eq!(e.count, 0);
+            let l = sc_world_launches(std::ptr::null_mut());
+            assert!(l.launches.is_null());
+            assert_eq!(l.count, 0);
+            assert_eq!(
+                sc_world_add_standing_order(std::ptr::null_mut(), std::ptr::null()),
+                0
+            );
+            assert!(!sc_world_cancel_standing_order(std::ptr::null_mut(), 1));
+            assert_eq!(
+                sc_world_standing_order_stock(std::ptr::null_mut(), 1),
+                u32::MAX
+            );
         }
     }
 
@@ -1309,6 +1469,130 @@ mod tests {
             assert!(sc_world_set_terrain(w, &t, [7.0f32].as_ptr(), 1));
             let (ox, oy, ..) = (*w).sim.terrain().parts().unwrap();
             assert_eq!((ox, oy), (1e6 - 5.0, -2e6 + 5.0));
+            sc_world_destroy(w);
+        }
+    }
+
+    fn launches_of(w: *mut ScWorld) -> Vec<ScLaunch> {
+        // SAFETY: `w` is a live handle on this thread; the launches are copied out before any
+        // other call on it, and only read when there are some (NULL otherwise).
+        unsafe {
+            let l = sc_world_launches(w);
+            if l.count == 0 {
+                assert!(l.launches.is_null());
+                return Vec::new();
+            }
+            std::slice::from_raw_parts(l.launches, l.count as usize).to_vec()
+        }
+    }
+
+    fn sop(x: f64, y: f64) -> ScStandingOrder {
+        ScStandingOrder {
+            x,
+            y,
+            radius_m: 300.0,
+            kinds: 0,
+            stock: 3,
+            cooldown_ticks: 15,
+            _reserved: 0,
+            launch: ScUnitSpec {
+                z: 5.0,
+                erp_w: 1.0,
+                kind: kind::FIXED_WING_DRONE,
+                affiliation: 1,
+                options: spawn::PURSUER | spawn::EMITTING,
+                outcome_class: 1,
+                speed_mps: 80.0,
+                max_turn_rate_rad_s: 1.0,
+                engagement_radius_m: 10.0,
+                ..ScUnitSpec::default()
+            },
+        }
+    }
+
+    #[test]
+    fn standing_orders_over_the_c_api() {
+        let w = sc_world_create(4);
+        let rules = ScRules {
+            detection_max_range_m: 20_000.0,
+            sensor_base_range_m: 20_000.0,
+            sensor_reference_power_w: 1.0,
+            exposure_threshold_ticks: 1,
+            exposure_cap_ticks: 1,
+            exposure_decay_per_tick: 1,
+            ..ScRules::default()
+        };
+        // SAFETY: `w` (and the restored `r`) are live handles used only on this thread and
+        // destroyed once; every pointer passed is to a live local.
+        unsafe {
+            assert!(sc_world_set_rules(w, &rules, std::ptr::null(), 0));
+            assert!(sc_world_add_sensor(w, 1, std::ptr::null()));
+            let node = Position {
+                x: 50_000.0,
+                y: 0.0,
+                z: 0.0,
+            };
+            (*w).sim.set_command_node_position(node);
+            let mut radar = unit_at(2_000.0, 0.0, 2, kind::GROUND_RADAR);
+            radar.options = spawn::EMITTING;
+            let target = sc_world_spawn(w, &radar);
+
+            // Rejected without changing anything: no pursuit, a sensor launch, a hostile
+            // launch, reserved bits, the stock sentinel, a bad pursuit, a bad zone.
+            let mut bad = Vec::new();
+            let cases: [fn(&mut ScStandingOrder); 8] = [
+                |o| o.launch.options = spawn::EMITTING,
+                |o| o.launch.options |= spawn::SENSOR,
+                |o| o.launch.affiliation = 2,
+                |o| o._reserved = 1,
+                |o| o.launch._reserved = 1,
+                |o| o.stock = u32::MAX,
+                |o| o.launch.speed_mps = 0.0,
+                |o| o.radius_m = f64::NAN,
+            ];
+            for f in cases {
+                let mut o = sop(2_000.0, 0.0);
+                f(&mut o);
+                bad.push(sc_world_add_standing_order(w, &o));
+            }
+            assert_eq!(bad, [0; 8]);
+            assert_eq!((*w).sim.standing_orders().count(), 0);
+
+            let id = sc_world_add_standing_order(w, &sop(2_000.0, 0.0));
+            assert_eq!(id, 1);
+            // The zone was fixed in the world when the order was added; the launch point
+            // follows the node.
+            let (_, o) = (*w).sim.standing_orders().next().unwrap();
+            assert_eq!((o.center_x, o.center_y), (52_000.0, 0.0));
+            (*w).sim.set_command_node_position(Position {
+                x: 51_000.0,
+                ..node
+            });
+            sc_world_step(w, 1);
+            let l = launches_of(w);
+            assert_eq!(l.len(), 1);
+            assert_eq!((l[0].tick, l[0].order_id, l[0].target_id), (1, id, target));
+            let p = (*w).sim.position(StableId(l[0].pursuer_id)).unwrap();
+            assert_eq!((p.x, p.y, p.z), (51_000.0, 0.0, 5.0));
+            assert_eq!(sc_world_standing_order_stock(w, id), 2);
+            assert_eq!(launches_of(w), l, "calling again returns the same launches");
+
+            // Saved with the world: the restored one carries on identically.
+            let b = sc_world_save(w);
+            let r = sc_world_restore(b.data, b.len);
+            assert!(!r.is_null());
+            assert_eq!(sc_world_standing_order_stock(r, id), 2);
+            assert!(launches_of(r).is_empty(), "empty after a restore");
+            for _ in 0..300 {
+                sc_world_step(w, 1);
+                sc_world_step(r, 1);
+                assert_eq!(launches_of(w), launches_of(r));
+                assert_eq!(engagements_of(w), engagements_of(r));
+            }
+            assert!(sc_world_cancel_standing_order(w, id));
+            assert!(!sc_world_cancel_standing_order(w, id));
+            assert_eq!(sc_world_standing_order_stock(w, id), u32::MAX);
+            sc_world_destroy(r);
             sc_world_destroy(w);
         }
     }

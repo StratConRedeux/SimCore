@@ -10,6 +10,9 @@ pub const ABI_VERSION: u32 = 1;
 /// Simulation rate. The engine advances in fixed ticks of `1 / TICKS_PER_SECOND` seconds.
 pub const TICKS_PER_SECOND: u32 = 15;
 
+/// No world holds more active standing orders than this (revision 1.5).
+pub const MAX_STANDING_ORDERS: u32 = 64;
+
 /// Affiliation codes (`ScUnitView::affiliation`).
 pub mod affiliation {
     pub const UNKNOWN: u8 = 0;
@@ -322,7 +325,64 @@ pub struct ScSensor {
     pub reference_power_w: f64,
 }
 
+/// A standing order for `sc_world_add_standing_order` (revision 1.5): engage detected hostiles
+/// in a zone, launching `launch` from the command node, from limited stock.
+///
+/// The zone centre is `f64` metres relative to the command node when the call is made (then fixed
+/// in the world); the zone is a horizontal disc. `launch` must be friendly and have
+/// `spawn::PURSUER` (and not `spawn::SENSOR`); its position is relative to the command node at
+/// each launch, and its velocity and `target_id` are ignored.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScStandingOrder {
+    pub x: f64,
+    pub y: f64,
+    /// Positive and finite.
+    pub radius_m: f64,
+    /// Bit `k` engages units of kind `k`; 0 engages every kind.
+    pub kinds: u32,
+    /// Launches available, at most `u32::MAX - 1`.
+    pub stock: u32,
+    /// Ticks after a launch before the next; 0 and 1 both allow one every tick.
+    pub cooldown_ticks: u32,
+    pub _reserved: u32,
+    pub launch: ScUnitSpec,
+}
+
+/// One launch by a standing order during the most recent `sc_world_step` (revision 1.5).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScLaunch {
+    /// The tick count once the launch's tick completed.
+    pub tick: u64,
+    pub order_id: u64,
+    /// The launched unit; its engagement names it as the pursuer.
+    pub pursuer_id: u64,
+    pub target_id: u64,
+}
+
+/// A read-only view of the latest step's launches, in order.
+///
+/// `launches` points into engine-owned memory and is valid until the next `sc_world_launches`
+/// or `sc_world_destroy` on the same world.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ScLaunches {
+    pub launches: *const ScLaunch,
+    pub count: u32,
+    pub _reserved: u32,
+}
+
 const _: () = {
+    assert!(core::mem::size_of::<ScStandingOrder>() == 152);
+    assert!(core::mem::align_of::<ScStandingOrder>() == 8);
+    assert!(core::mem::offset_of!(ScStandingOrder, radius_m) == 16);
+    assert!(core::mem::offset_of!(ScStandingOrder, kinds) == 24);
+    assert!(core::mem::offset_of!(ScStandingOrder, cooldown_ticks) == 32);
+    assert!(core::mem::offset_of!(ScStandingOrder, launch) == 40);
+    assert!(core::mem::size_of::<ScLaunch>() == 32);
+    assert!(core::mem::offset_of!(ScLaunch, pursuer_id) == 16);
+    assert!(core::mem::size_of::<ScLaunches>() == 16);
     assert!(core::mem::size_of::<ScRules>() == 48);
     assert!(core::mem::offset_of!(ScRules, default_chance) == 24);
     assert!(core::mem::offset_of!(ScRules, exposure_threshold_ticks) == 32);
