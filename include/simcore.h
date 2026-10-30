@@ -289,8 +289,8 @@ uint32_t sc_abi_version(void);
 ScWorld *SC_NULLABLE sc_world_create(uint64_t seed);
 
 /* Creates a world populated with `unit_count` dummy units (benchmarks and UI work).
-   Returns NULL on failure, including unit_count == UINT32_MAX (the units plus the
-   command node would not fit in ScFrame.count). */
+   Returns NULL on failure, including unit_count > 2^24 - 2 (more units than a world
+   has ids for: its snapshot could not be restored). */
 ScWorld *SC_NULLABLE sc_world_create_dummy(uint64_t seed, uint32_t unit_count);
 
 /* Safe to call with NULL. */

@@ -108,6 +108,8 @@ swift package dump-package | grep -qF "\"$CHECKSUM\"" || die "root Package.swift
 # --- Tests ---
 echo "==> cargo test --workspace"
 cargo test --locked --quiet --workspace
+echo "==> C conformance against the release build"
+cargo test --locked --quiet --release -p simcore-ffi --test c_conformance
 echo "==> swift test (bindings/swift, local XCFramework)"
 (cd bindings/swift && swift test)
 # The manifest being tagged, against the zip being uploaded.

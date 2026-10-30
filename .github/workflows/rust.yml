@@ -37,6 +37,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: C conformance against the release build
+        # The build that ships: release, LTO, panic = "abort".
+        run: cargo test --release -p simcore-ffi --test c_conformance
       - name: Build for iOS
         run: |
           cargo build --release -p simcore-ffi --target aarch64-apple-ios

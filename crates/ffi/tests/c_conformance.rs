@@ -14,8 +14,11 @@ fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// One per profile, so a debug and a release run never share binaries.
 fn out_dir() -> PathBuf {
-    root().join("target/c-conformance")
+    root()
+        .join("target/c-conformance")
+        .join(if release() { "release" } else { "debug" })
 }
 
 fn release() -> bool {

@@ -11,6 +11,7 @@
 mod components;
 mod gameplay;
 mod grid;
+mod heatmap;
 mod orders;
 mod rng;
 mod snapshot;
@@ -23,9 +24,9 @@ pub use components::{
     Sensor, SensorParams, StableId, UnitKind, Velocity,
 };
 pub use gameplay::{
-    EmitterView, EngagementEvent, Heatmap, HeatmapSpec, OutcomeTable, Rules, SensorView, opposing,
-    sensor_observes,
+    EmitterView, EngagementEvent, OutcomeTable, Rules, SensorView, opposing, sensor_observes,
 };
+pub use heatmap::{Heatmap, HeatmapSpec};
 pub use orders::{CommandError, Emcon, LinkRules, Order};
 pub use rng::Pcg32;
 pub use simcore_abi::{ScStatus, ScUnitView, TICKS_PER_SECOND};
@@ -52,6 +53,9 @@ pub use simcore_abi::kind;
 /// The largest stable id a world can save and restore (`2^24 - 1`). [`Sim::spawn`] refuses to
 /// go past it.
 pub const MAX_UNIT_ID: u64 = (1 << 24) - 1;
+/// Most units [`Sim::new_dummy`] makes: every id after the command node's, up to
+/// [`MAX_UNIT_ID`].
+pub const MAX_DUMMY_UNITS: u32 = MAX_UNIT_ID as u32 - 1;
 
 /// Why [`Sim::spawn`] rejected a unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,7 +222,12 @@ impl Sim {
 
     /// A world with the command node plus `unit_count` dummy units within about 40 km,
     /// with mixed affiliation, seeded velocities, and some emitters on a duty cycle.
+    ///
+    /// # Panics
+    ///
+    /// If `unit_count` exceeds [`MAX_DUMMY_UNITS`]: the world could not be restored.
     pub fn new_dummy(seed: u64, unit_count: u32) -> Sim {
+        assert!(unit_count <= MAX_DUMMY_UNITS, "more dummy units than ids");
         let mut sim = Sim::new(seed);
         let mut rng = Pcg32::new(seed, 0x51_4d_43_4f_52_45); // "SIMCORE"
         const KINDS: [u16; 5] = [

@@ -315,9 +315,16 @@ private enum Environment {
         let restored = try #require(SimWorld(snapshot: world.save()))
         #expect(restored.standingOrderStock(id) == 1)
         #expect(restored.launches.isEmpty)
-        world.step(100)
-        restored.step(100)
-        #expect(world.engagements.map(\.pursuer_id) == restored.engagements.map(\.pursuer_id))
+        // The pursuer covers the 3 km at 100 m/s in about 450 ticks.
+        var resolved: [UInt64] = []
+        for _ in 0..<600 where resolved.isEmpty {
+            world.step()
+            restored.step()
+            #expect(world.engagements.map(\.pursuer_id) == restored.engagements.map(\.pursuer_id))
+            resolved = world.engagements.map(\.pursuer_id)
+        }
+        #expect(resolved == [l.pursuer_id], "the launched pursuer engages, in both worlds")
+        #expect(world.save() == restored.save())
         #expect(world.cancelStandingOrder(id))
         #expect(world.standingOrderStock(id) == nil)
         #expect(!world.cancelStandingOrder(id))

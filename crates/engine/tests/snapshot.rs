@@ -236,6 +236,8 @@ fn restored_world_continues_identically() {
         }
         assert_eq!(a.status(), b.status(), "chunk {chunk}");
         assert!(bits(a.frame()) == bits(b.frame()), "chunk {chunk}");
+        // The hidden state too (exposure, moves, RNG, cooldowns), not only what is shown.
+        assert!(a.save() == b.save(), "chunk {chunk}");
     }
     println!(
         "after restore: {events} engagements, {launches} launches, {} units, {:?}",
