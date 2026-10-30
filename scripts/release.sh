@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Cuts a release locally: builds and zips the XCFramework, points the root Package.swift at the
-# zip's GitHub Release asset, runs the tests, commits "Release <version>" and creates an
-# annotated tag. It never pushes and never creates the GitHub Release: it prints the commands
+# Cuts a release locally: sets the Cargo workspace version, builds and zips the XCFramework,
+# points the root Package.swift at the zip's GitHub Release asset, runs the tests, commits
+# "Release <version>" and creates an annotated tag. It never pushes and never creates the GitHub Release: it prints the commands
 # for a human to run. See docs/releasing.md.
 #
 # Usage: scripts/release.sh [--dry-run] <version>
-#   <version>  semantic version without a "v" prefix, for example 0.2.0 or 0.2.0-rc.1
+#   <version>  semantic version without a "v" prefix, for example 1.2.3 or 1.2.3-rc.1
 #   --dry-run  do everything in a temporary clone; the real repo, its tags and index are untouched
 set -euo pipefail
 
@@ -59,6 +59,22 @@ fi
 ZIP="$ROOT/build/SimCore.xcframework.zip"
 ASSET_URL="https://github.com/$REPO/releases/download/$VERSION/SimCore.xcframework.zip"
 
+# From here until the commit, any exit (including `die`) restores the files the release
+# rewrites from HEAD, so the tree is clean for a rerun. A dry run's clone is throwaway, so it
+# needs no restoring.
+RELEASE_FILES=(Cargo.toml Cargo.lock Package.swift)
+trap 'exit 130' INT TERM
+(( DRY_RUN )) || trap 'git checkout HEAD -- "${RELEASE_FILES[@]}"' EXIT
+
+# --- Cargo version ---
+# The crates carry the release version (before the build, which embeds it). Only the
+# [workspace.package] table's `version` line changes; the lockfile follows, offline.
+sed -E -i '' -e "/^\[workspace\.package\]/,/^\[/ s/^version = \"[^\"]*\"$/version = \"$VERSION\"/" Cargo.toml
+[[ "$(cargo metadata --offline --no-deps --format-version 1 \
+    | /usr/bin/python3 -I -c 'import json, sys; print(" ".join(sorted({p["version"] for p in json.load(sys.stdin)["packages"]})))')" == "$VERSION" ]] \
+    || die "could not set the Cargo workspace version to $VERSION"
+cargo update --offline --workspace --quiet
+
 # --- Build and zip ---
 scripts/build-xcframework.sh
 
@@ -93,10 +109,6 @@ echo "==> $ZIP"
 echo "  checksum $CHECKSUM"
 
 # --- Point the root manifest at the release asset ---
-# From here until the commit, any exit (including `die`) restores Package.swift from HEAD, so
-# the tree is clean for a rerun. A dry run's clone is throwaway, so it needs no restoring.
-trap 'exit 130' INT TERM
-(( DRY_RUN )) || trap 'git checkout HEAD -- Package.swift' EXIT
 sed -E -i '' \
     -e "s#^( *)url: \"https://github\\.com/[^\"]*/SimCore\\.xcframework\\.zip\",#\\1url: \"$ASSET_URL\",#" \
     -e "s#^( *)checksum: \"[0-9a-f]{64}\"#\\1checksum: \"$CHECKSUM\"#" \
@@ -116,7 +128,7 @@ echo "==> swift test (bindings/swift, local XCFramework)"
 scripts/check-root-manifest.sh "$ZIP"
 
 # --- Commit and tag (local only) ---
-git add Package.swift
+git add "${RELEASE_FILES[@]}"
 git commit --quiet -m "Release $VERSION"
 # If tagging fails, drop the release commit too, so the rerun starts from the same HEAD and
 # gives the same zip.

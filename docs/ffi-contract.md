@@ -5,6 +5,8 @@ The only interface between the Rust engine and the iOS app. The app does no game
 ## Sources of truth
 - `crates/abi/src/lib.rs`: `#[repr(C)]` types and constants, with compile-time size and offset checks.
 - `include/simcore.h`: the same layout for C and Swift. Keep the two identical. Changing an existing layout or signature bumps `ABI_VERSION`; additions (new types and functions) bump only the header revision.
+- `crates/ffi/tests/c_conformance.rs` checks that they are: a C program generated from the header prints every struct's size and alignment, every field's offset, size and type, and every `SC_*` constant, and the result must equal the same table from the `abi` crate. It also checks the exported symbols against the header's functions.
+- The contract's version (above) is separate from SimCore's release version (the git tag, which `scripts/release.sh` also writes into the Cargo workspace version).
 
 ## Rules
 - **Coordinates.** The engine stores `f64` metres in a local east-north-up world frame. Frames carry `f32` metres relative to the player's command node (floating origin), so values near the player stay precise. Velocities are world-frame m/s, not relative to the node's motion. Commands and setup calls take positions in the same node-relative frame.

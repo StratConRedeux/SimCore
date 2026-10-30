@@ -1,6 +1,6 @@
 // swift-tools-version: 6.2
 // The manifest SwiftPM consumers resolve: pin to a release tag, for example
-//   .package(url: "https://github.com/StratConRedeux/SimCore.git", exact: "0.2.0")
+//   .package(url: "https://github.com/StratConRedeux/SimCore.git", exact: "<version>")
 // The XCFramework comes from that tag's GitHub Release asset. scripts/release.sh rewrites the
 // `url` and `checksum` below; don't edit them by hand. For local development against a fresh
 // build/SimCore.xcframework, use bindings/swift/Package.swift instead (docs/releasing.md).
