@@ -402,3 +402,82 @@ private enum Environment {
         #expect(restored.standingOrders.count == 2)
     }
 }
+
+/// Contract revision 1.7: direct orders and host tags.
+@Suite struct ContractRevision17Tests {
+    /// A world with a hostile vehicle (2), a duty-cycled hostile radar (3) and a hostile pursuer
+    /// (4) after the command node, and a long link delay.
+    private func hostileWorld() throws -> SimWorld {
+        let world = try #require(SimWorld(seed: 17))
+        var link = ScLinkRules()
+        (link.base_delay_ticks, link.max_delay_ticks) = (40, 100)
+        #expect(world.setLinkRules(link))
+        var vehicle = ScUnitSpec()
+        (vehicle.y, vehicle.kind, vehicle.affiliation) = (10, SC_KIND_GROUND_VEHICLE, SimWorld.affiliationHostile)
+        #expect(world.spawn(vehicle) == 2)
+        var radar = ScUnitSpec()
+        (radar.x, radar.erp_w, radar.kind) = (200, 50, SC_KIND_GROUND_RADAR)
+        (radar.affiliation, radar.options) = (SimWorld.affiliationHostile, SimWorld.spawnCycle)
+        (radar.cycle_on_ticks, radar.cycle_off_ticks) = (4, 1)
+        #expect(world.spawn(radar) == 3)
+        var seeker = ScUnitSpec()
+        (seeker.x, seeker.kind, seeker.affiliation) = (900, SC_KIND_FIXED_WING_DRONE, SimWorld.affiliationHostile)
+        (seeker.options, seeker.target_id) = (SimWorld.spawnPursuer, 2)
+        (seeker.speed_mps, seeker.max_turn_rate_rad_s) = (1, 1)
+        #expect(world.spawn(seeker) == 4)
+        return world
+    }
+
+    private func unit(_ world: SimWorld, _ id: UInt64) -> ScUnitView? {
+        world.withFrame { $0.first { $0.id == id } }
+    }
+
+    @Test func directOrdersReachHostileUnitsAtOnce() throws {
+        let world = try hostileWorld()
+        #expect(world.command(2, .halt) == nil, "commands stay friendly-only")
+        #expect(!world.order(99, .halt), "unknown unit")
+        #expect(!world.order(4, .halt), "a pursuer does not halt")
+        #expect(!world.order(2, .retarget(1)), "only pursuers retarget")
+        #expect(!world.order(4, .retarget(4)), "not at itself")
+        #expect(!world.order(2, .move(x: 30, y: 10, z: 0, speedMps: 0)))
+        #expect(world.order(2, .move(x: 30, y: 10, z: 0, speedMps: 15)))
+        #expect(world.order(3, .emissions(radiate: false)))
+        #expect(world.order(4, .retarget(1)))
+        #expect(world.status.pending_commands == 0 && world.status.dropped_commands == 0)
+
+        // 30 m at 15 m/s: there after 30 ticks, stopped on the next; no link delay.
+        world.step(31)
+        let v = try #require(unit(world, 2))
+        #expect(abs(v.x - 30) < 1e-4 && v.vx == 0)
+        let r = try #require(unit(world, 3))
+        #expect(r.flags & SimWorld.flagEmitting == 0, "silent from the next tick")
+        let s = try #require(unit(world, 4))
+        #expect(s.vx < 0, "heading for the command node")
+        #expect(world.order(3, .emissions(radiate: true)))
+        world.step(1)
+        #expect(world.status.pending_commands == 0)
+        #expect(world.command(1, .halt) == 1, "orders take no command ids")
+    }
+
+    @Test func tagsAreSavedAndDefaultToZero() throws {
+        let world = try hostileWorld()
+        #expect(world.tag(2) == 0)
+        #expect(world.setTag(2, .max))
+        #expect(world.setTag(3, 42))
+        #expect(!world.setTag(99, 1), "unknown unit")
+        #expect(world.tag(99) == 0)
+        #expect(world.tag(2) == .max && world.tag(3) == 42)
+        #expect(world.setTag(3, 0), "0 clears")
+        #expect(world.tag(3) == 0)
+        #expect(world.order(2, .move(x: 50, y: 10, z: 0, speedMps: 5)))
+        world.step(5)
+
+        let bytes = world.save()
+        let restored = try #require(SimWorld(snapshot: bytes))
+        #expect(restored.save() == bytes, "canonical bytes, a hostile mid-move included")
+        #expect(restored.tag(2) == .max && restored.tag(3) == 0)
+        world.step(30)
+        restored.step(30)
+        #expect(world.save() == restored.save())
+    }
+}

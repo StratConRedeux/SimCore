@@ -1,8 +1,9 @@
 import Foundation
 @_exported import SimCoreC
 
-/// What a command tells a friendly unit to do. Positions are metres relative to the command
-/// node at the moment the command is issued, the same frame as `ScUnitView`.
+/// What a command tells a friendly unit to do, or a direct order (`SimWorld.order`) any unit.
+/// Positions are metres relative to the command node at the moment it is issued, the same
+/// frame as `ScUnitView`.
 public enum SimOrder: Equatable, Sendable {
     /// Travel straight to `(x, y, z)` at `speedMps`, then stop. Not for pursuers.
     case move(x: Float, y: Float, z: Float, speedMps: Float)
@@ -103,6 +104,13 @@ extension SimWorld {
     /// values).
     @discardableResult
     public func command(_ unit: UInt64, _ order: SimOrder) -> UInt64? {
+        var c = Self.scCommand(unit, order)
+        let id = sc_world_command(handle, &c)
+        return id == 0 ? nil : id
+    }
+
+    /// The C command for `order` to `unit`.
+    fileprivate static func scCommand(_ unit: UInt64, _ order: SimOrder) -> ScCommand {
         var c = ScCommand()
         c.unit_id = unit
         switch order {
@@ -118,8 +126,7 @@ extension SimWorld {
             c.type = SC_COMMAND_EMISSIONS
             c.radiate = radiate ? 1 : 0
         }
-        let id = sc_world_command(handle, &c)
-        return id == 0 ? nil : id
+        return c
     }
 
     /// Ticks a command to `unit` issued now would take to arrive; `nil` if it does not exist.
@@ -287,5 +294,35 @@ extension SimWorld {
         let s = sc_world_standing_orders(handle)
         guard let orders = s.orders, s.count > 0 else { return [] }
         return Array(UnsafeBufferPointer(start: orders, count: Int(s.count)))
+    }
+}
+
+// MARK: - Contract revision 1.7: direct orders and host tags
+
+extension SimWorld {
+    /// Applies `order` to `unit` at once, before the next step, whatever its affiliation: for
+    /// hosts that drive another side or scripted units. The same type and value checks as
+    /// `command` apply, but there is no link delay, nothing is queued, and the status counters
+    /// do not change. A duty-cycled emitter follows an emissions order from the next tick.
+    /// `false` if the engine rejects it (unknown unit, wrong unit type, invalid values).
+    @discardableResult
+    public func order(_ unit: UInt64, _ order: SimOrder) -> Bool {
+        precondition(!readingFrame, "SimWorld.order called inside withFrame")
+        var c = Self.scCommand(unit, order)
+        return sc_world_order(handle, &c)
+    }
+
+    /// The host's tag on `unit`: 0 if unset, or if the unit is unknown or removed. The engine
+    /// never reads it.
+    public func tag(_ unit: UInt64) -> UInt64 {
+        sc_world_tag(handle, unit)
+    }
+
+    /// Sets the host's tag on a live unit; 0 clears it. Saved with the world and cleared when
+    /// the unit is removed. `false` for an unknown or removed unit.
+    @discardableResult
+    public func setTag(_ unit: UInt64, _ tag: UInt64) -> Bool {
+        precondition(!readingFrame, "SimWorld.setTag called inside withFrame")
+        return sc_world_set_tag(handle, unit, tag)
     }
 }
