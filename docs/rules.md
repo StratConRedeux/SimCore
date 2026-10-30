@@ -346,6 +346,15 @@ relative to the node at each launch. `sc_world_standing_order_stock` gives the r
 (`UINT32_MAX` for no such order, so stock is at most `UINT32_MAX - 1`), and `sc_world_launches`
 the `ScLaunch`es of the latest step.
 
+`Sim::standing_orders_with_status()` lists the active orders in id order, out-of-stock ones
+included, each with its `StandingOrderStatus`; `Sim::to_frame(position)` converts a world
+position to the frame's coordinates (`f32` m relative to the command node now). Over the C API
+(revision 1.6), `sc_world_standing_orders` gives an `ScStandingOrderView` per order: id, zone
+centre in frame coordinates, radius (rounded to `f32`: one beyond its range lists as infinity
+or 0), kinds, remaining and original stock, `ready_tick` and cooldown. The zone is fixed in the
+world, so its centre moves in the frame as the node moves, exactly as a unit standing there
+would. A restored world lists the same orders as the saved one.
+
 **Cost.** Orders cooling down or out of stock cost nothing. While any order is ready, each tick
 collects the detected hostiles in one pass over the units, plus the friendly pursuers' targets,
 then tests each contact against each ready order: ~0.3 ms for eight orders on the 50,000-unit

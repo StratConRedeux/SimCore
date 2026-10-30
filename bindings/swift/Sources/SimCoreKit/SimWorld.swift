@@ -274,3 +274,18 @@ extension SimWorld {
         return Array(UnsafeBufferPointer(start: launches, count: Int(l.count)))
     }
 }
+
+// MARK: - Contract revision 1.6: listing standing orders
+
+extension SimWorld {
+    /// The active standing orders in id order, out-of-stock ones included. Each zone centre is
+    /// relative to the command node now, like the frame's units, so a ring drawn there stays
+    /// fixed in the world while the node moves. After a restore it lists the same orders as
+    /// before the save. Copied out of the engine; an empty result does not allocate.
+    public var standingOrders: [ScStandingOrderView] {
+        // Its own buffer, separate from the frame's, so this is safe inside `withFrame`.
+        let s = sc_world_standing_orders(handle)
+        guard let orders = s.orders, s.count > 0 else { return [] }
+        return Array(UnsafeBufferPointer(start: orders, count: Int(s.count)))
+    }
+}

@@ -335,3 +335,39 @@ fn an_extreme_launch_speed_still_launches_and_leaves_others_their_targets() {
     assert!(v.x.is_finite() && v.y.is_finite() && v.z.is_finite());
     assert!(v.y < 0.0, "pointing down y, at the target");
 }
+
+#[test]
+fn the_listing_reports_each_order_with_its_progress() {
+    let mut sim = world(0.0);
+    hostile(&mut sim, kind::GROUND_RADAR, 10_000.0, 0.0, 10.0);
+    let a = sim.add_standing_order(order(2, 30)).unwrap();
+    let mut far = order(0, 5);
+    far.center_y = 40_000.0;
+    let b = sim.add_standing_order(far).unwrap();
+    sim.step(1);
+    let got: Vec<_> = sim
+        .standing_orders_with_status()
+        .map(|(id, o, s)| (id, o.center_y, s))
+        .collect();
+    let ready = StandingOrderStatus {
+        remaining: 1,
+        ready_tick: 31,
+    };
+    let empty = StandingOrderStatus {
+        remaining: 0,
+        ready_tick: 0,
+    };
+    assert_eq!(got, [(a, 0.0, ready), (b, 40_000.0, empty)]);
+    assert_eq!(sim.standing_order(a), Some(ready));
+    assert!(sim.cancel_standing_order(a));
+    assert_eq!(sim.standing_orders_with_status().count(), 1);
+}
+
+#[test]
+fn to_frame_is_relative_to_the_command_node_now() {
+    let mut sim = world(0.0);
+    let at = p(10_000.25, -3.0, 2.0);
+    assert_eq!(sim.to_frame(at), [10_000.25, -3.0, 2.0]);
+    sim.set_command_node_position(p(1_000_000.0, 1.0, 0.0));
+    assert_eq!(sim.to_frame(at), [-989_999.75, -4.0, 2.0]);
+}

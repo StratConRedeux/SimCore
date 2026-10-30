@@ -623,7 +623,17 @@ impl Sim {
 
     /// Active standing orders, in id order.
     pub fn standing_orders(&self) -> impl Iterator<Item = (u64, &StandingOrder)> {
-        self.standing.active.iter().map(|a| (a.id, &a.order))
+        self.standing_orders_with_status().map(|(id, o, _)| (id, o))
+    }
+
+    /// Active standing orders with their progress, in id order, out-of-stock ones included.
+    pub fn standing_orders_with_status(
+        &self,
+    ) -> impl Iterator<Item = (u64, &StandingOrder, StandingOrderStatus)> {
+        self.standing
+            .active
+            .iter()
+            .map(|a| (a.id, &a.order, a.status))
     }
 
     /// Launches by standing orders during the most recent [`Sim::step`] call, in order. The
@@ -711,6 +721,17 @@ impl Sim {
             });
         }
         &self.frame
+    }
+
+    /// A world position in the frame's coordinates: `f32` metres relative to the command node
+    /// now, as [`Sim::frame`] gives unit positions.
+    pub fn to_frame(&self, position: Position) -> [f32; 3] {
+        let origin = self.command_node_position();
+        [
+            to_local_f32(position.x, origin.x),
+            to_local_f32(position.y, origin.y),
+            to_local_f32(position.z, origin.z),
+        ]
     }
 
     /// Capacity of the reused frame buffer, in units.

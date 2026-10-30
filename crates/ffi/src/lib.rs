@@ -3,7 +3,7 @@
 //! Every export:
 //! - accepts a NULL handle and returns a safe default (NULL, 0, `false`, `UINT32_MAX` for a link
 //!   delay or a standing order's stock, or an empty [`ScFrame`], [`ScEngagements`],
-//!   [`ScLaunches`], [`ScStatus`] or [`ScBytes`]);
+//!   [`ScLaunches`], [`ScStandingOrders`], [`ScStatus`] or [`ScBytes`]);
 //! - catches unwinding, so no panic crosses the boundary. Release builds use `panic = "abort"`,
 //!   where a panic aborts the process instead; that is also defined behaviour.
 //!
@@ -14,8 +14,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub use simcore_abi::{
     ABI_VERSION, MAX_STANDING_ORDERS, ScBytes, ScCommand, ScEngagement, ScEngagements, ScFrame,
-    ScLaunch, ScLaunches, ScLinkRules, ScOutcome, ScRules, ScSensor, ScStandingOrder, ScStatus,
-    ScTerrain, ScUnitSpec, ScUnitView, TICKS_PER_SECOND, command, engagement, kind, spawn,
+    ScLaunch, ScLaunches, ScLinkRules, ScOutcome, ScRules, ScSensor, ScStandingOrder,
+    ScStandingOrderView, ScStandingOrders, ScStatus, ScTerrain, ScUnitSpec, ScUnitView,
+    TICKS_PER_SECOND, command, engagement, kind, spawn,
 };
 use simcore_engine::{
     EmitterCycle, EmsProfile, LinkRules, Order, OutcomeTable, Position, Pursuer, Rules, Sensor,
@@ -29,6 +30,8 @@ pub struct ScWorld {
     engagements: Vec<ScEngagement>,
     /// The latest step's standing-order launches in C layout, rebuilt by `sc_world_launches`.
     launches: Vec<ScLaunch>,
+    /// The active standing orders in C layout, rebuilt by `sc_world_standing_orders`.
+    standing_orders: Vec<ScStandingOrderView>,
 }
 
 /// The frame returned on a NULL handle or a failure: null pointer, count 0, tick 0.
@@ -58,6 +61,7 @@ fn into_handle(sim: Sim) -> *mut ScWorld {
         sim,
         engagements: Vec::new(),
         launches: Vec::new(),
+        standing_orders: Vec::new(),
     }))
 }
 
@@ -784,6 +788,71 @@ pub unsafe extern "C" fn sc_world_launches(world: *mut ScWorld) -> ScLaunches {
     })
 }
 
+/// The standing orders returned on a NULL handle or a failure: null pointer, count 0.
+pub const fn empty_standing_orders() -> ScStandingOrders {
+    ScStandingOrders {
+        orders: std::ptr::null(),
+        count: 0,
+        _reserved: 0,
+    }
+}
+
+/// `ScStandingOrders sc_world_standing_orders(ScWorld *world);` Returns
+/// [`empty_standing_orders`] on NULL or failure.
+///
+/// The active standing orders in id order, out-of-stock ones included, each zone centre relative
+/// to the command node now (as [`Sim::to_frame`] gives it, like the frame's units). The returned
+/// `orders` points into a buffer the handle reuses and stays valid until the next
+/// `sc_world_standing_orders` or `sc_world_destroy` on this handle.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_standing_orders(world: *mut ScWorld) -> ScStandingOrders {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return empty_standing_orders();
+    };
+    guard(empty_standing_orders(), || {
+        let sim = &w.sim;
+        w.standing_orders.clear();
+        w.standing_orders
+            .extend(sim.standing_orders_with_status().map(|(id, o, s)| {
+                let [x, y, _] = sim.to_frame(Position {
+                    x: o.center_x,
+                    y: o.center_y,
+                    z: 0.0,
+                });
+                ScStandingOrderView {
+                    id,
+                    x,
+                    y,
+                    // Rounded to f32 like the centre: beyond its range, infinity or 0 (documented).
+                    radius_m: o.radius_m as f32,
+                    kinds: o.kinds,
+                    remaining: s.remaining,
+                    stock: o.stock,
+                    ready_tick: s.ready_tick,
+                    cooldown_ticks: o.cooldown_ticks,
+                    _reserved: 0,
+                }
+            }));
+        let Ok(count) = u32::try_from(w.standing_orders.len()) else {
+            return empty_standing_orders();
+        };
+        ScStandingOrders {
+            // An empty slice's pointer is dangling; the contract says NULL for "none".
+            orders: if count == 0 {
+                std::ptr::null()
+            } else {
+                w.standing_orders.as_ptr()
+            },
+            count,
+            _reserved: 0,
+        }
+    })
+}
+
 /// The exports with the exact C signatures from `include/simcore.h`. If a signature drifts,
 /// this stops compiling.
 const _: () = {
@@ -813,6 +882,7 @@ const _: () = {
     let _: unsafe extern "C" fn(*mut ScWorld, u64) -> bool = sc_world_cancel_standing_order;
     let _: unsafe extern "C" fn(*mut ScWorld, u64) -> u32 = sc_world_standing_order_stock;
     let _: unsafe extern "C" fn(*mut ScWorld) -> ScLaunches = sc_world_launches;
+    let _: unsafe extern "C" fn(*mut ScWorld) -> ScStandingOrders = sc_world_standing_orders;
 };
 
 #[cfg(test)]
@@ -836,6 +906,9 @@ mod tests {
             let l = sc_world_launches(std::ptr::null_mut());
             assert!(l.launches.is_null());
             assert_eq!(l.count, 0);
+            let s = sc_world_standing_orders(std::ptr::null_mut());
+            assert!(s.orders.is_null());
+            assert_eq!(s.count, 0);
             assert_eq!(
                 sc_world_add_standing_order(std::ptr::null_mut(), std::ptr::null()),
                 0
@@ -1592,6 +1665,120 @@ mod tests {
             assert!(sc_world_cancel_standing_order(w, id));
             assert!(!sc_world_cancel_standing_order(w, id));
             assert_eq!(sc_world_standing_order_stock(w, id), u32::MAX);
+            sc_world_destroy(r);
+            sc_world_destroy(w);
+        }
+    }
+
+    fn standing_orders_of(w: *mut ScWorld) -> Vec<ScStandingOrderView> {
+        // SAFETY: `w` is a live handle on this thread; the orders are copied out before any
+        // other call on it, and only read when there are some (NULL otherwise).
+        unsafe {
+            let s = sc_world_standing_orders(w);
+            if s.count == 0 {
+                assert!(s.orders.is_null());
+                return Vec::new();
+            }
+            std::slice::from_raw_parts(s.orders, s.count as usize).to_vec()
+        }
+    }
+
+    #[test]
+    fn standing_orders_are_listed_relative_to_the_command_node() {
+        let w = sc_world_create(4);
+        assert!(standing_orders_of(w).is_empty(), "none in a new world");
+        let rules = ScRules {
+            detection_max_range_m: 20_000.0,
+            sensor_base_range_m: 20_000.0,
+            sensor_reference_power_w: 1.0,
+            exposure_threshold_ticks: 1,
+            exposure_cap_ticks: 1,
+            exposure_decay_per_tick: 1,
+            ..ScRules::default()
+        };
+        // SAFETY: `w` (and the restored `r`) are live handles used only on this thread and
+        // destroyed once; every pointer passed is to a live local.
+        unsafe {
+            assert!(sc_world_set_rules(w, &rules, std::ptr::null(), 0));
+            assert!(sc_world_add_sensor(w, 1, std::ptr::null()));
+            let node = Position {
+                x: 50_000.0,
+                y: 0.0,
+                z: 0.0,
+            };
+            (*w).sim.set_command_node_position(node);
+            let mut radar = unit_at(2_000.0, 0.0, 2, kind::GROUND_RADAR);
+            radar.options = spawn::EMITTING;
+            let target = sc_world_spawn(w, &radar);
+
+            let id = sc_world_add_standing_order(w, &sop(2_000.0, 0.0));
+            let mut idle = sop(-500.0, 250.0);
+            (idle.stock, idle.kinds, idle.cooldown_ticks) = (0, 1 << kind::JAMMER, 40);
+            let empty = sc_world_add_standing_order(w, &idle);
+            assert_eq!((id, empty), (1, 2));
+            let view = |id, x, y, radius_m, kinds, remaining, stock, ready_tick, cooldown_ticks| {
+                ScStandingOrderView {
+                    id,
+                    x,
+                    y,
+                    radius_m,
+                    kinds,
+                    remaining,
+                    stock,
+                    ready_tick,
+                    cooldown_ticks,
+                    _reserved: 0,
+                }
+            };
+            let idle_at = |x, y| view(empty, x, y, 300.0, 1 << kind::JAMMER, 0, 0, 0, 40);
+            assert_eq!(
+                standing_orders_of(w),
+                [
+                    view(id, 2_000.0, 0.0, 300.0, 0, 3, 3, 0, 15),
+                    idle_at(-500.0, 250.0)
+                ],
+                "in id order, the out-of-stock one included"
+            );
+
+            // The zones stay fixed in the world, so their centres move in the frame as the
+            // node moves, exactly as the frame's units do.
+            (*w).sim.set_command_node_position(Position {
+                x: 51_000.0,
+                y: -100.0,
+                ..node
+            });
+            sc_world_step(w, 1);
+            let l = launches_of(w);
+            assert_eq!((l[0].order_id, l[0].target_id), (id, target));
+            let listed = standing_orders_of(w);
+            assert_eq!(
+                listed,
+                [
+                    view(id, 1_000.0, 100.0, 300.0, 0, 2, 3, 16, 15),
+                    idle_at(-1_500.0, 350.0)
+                ]
+            );
+            let f = sc_world_frame(w);
+            let frame = std::slice::from_raw_parts(f.units, f.count as usize);
+            let radar_view = frame.iter().find(|u| u.id == target).unwrap();
+            assert_eq!((radar_view.x, radar_view.y), (listed[0].x, listed[0].y));
+            assert_eq!(
+                standing_orders_of(w),
+                listed,
+                "calling again lists the same"
+            );
+
+            // Saved with the world: the restored one lists the same orders.
+            let b = sc_world_save(w);
+            let r = sc_world_restore(b.data, b.len);
+            assert!(!r.is_null());
+            assert_eq!(standing_orders_of(r), listed);
+
+            assert!(sc_world_cancel_standing_order(w, id));
+            assert_eq!(standing_orders_of(w), [idle_at(-1_500.0, 350.0)]);
+            assert!(sc_world_cancel_standing_order(w, empty));
+            assert!(standing_orders_of(w).is_empty(), "NULL once none are left");
+            assert_eq!(standing_orders_of(r).len(), 2, "each world its own");
             sc_world_destroy(r);
             sc_world_destroy(w);
         }

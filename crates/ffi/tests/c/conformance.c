@@ -74,6 +74,14 @@ _Static_assert(offsetof(ScStandingOrder, launch) == 40, "launch");
 _Static_assert(sizeof(ScLaunch) == 32, "ScLaunch size");
 _Static_assert(offsetof(ScLaunch, pursuer_id) == 16, "launch pursuer_id");
 _Static_assert(sizeof(ScLaunches) == 16, "ScLaunches size");
+_Static_assert(sizeof(ScStandingOrderView) == 48, "ScStandingOrderView size");
+_Static_assert(_Alignof(ScStandingOrderView) == 8, "ScStandingOrderView align");
+_Static_assert(offsetof(ScStandingOrderView, x) == 8, "order view x");
+_Static_assert(offsetof(ScStandingOrderView, radius_m) == 16, "order view radius_m");
+_Static_assert(offsetof(ScStandingOrderView, remaining) == 24, "order view remaining");
+_Static_assert(offsetof(ScStandingOrderView, ready_tick) == 32, "order view ready_tick");
+_Static_assert(offsetof(ScStandingOrderView, cooldown_ticks) == 40, "order view cooldown_ticks");
+_Static_assert(sizeof(ScStandingOrders) == 16, "ScStandingOrders size");
 
 /* Every function, through a pointer of exactly the header's type. */
 static uint32_t (*const p_abi_version)(void) = sc_abi_version;
@@ -104,6 +112,7 @@ static bool (*const p_cancel_standing_order)(ScWorld *, uint64_t) =
 static uint32_t (*const p_standing_order_stock)(ScWorld *, uint64_t) =
     sc_world_standing_order_stock;
 static ScLaunches (*const p_launches)(ScWorld *) = sc_world_launches;
+static ScStandingOrders (*const p_standing_orders)(ScWorld *) = sc_world_standing_orders;
 
 static int failures = 0;
 #define CHECK(cond)                                                                \
@@ -393,6 +402,82 @@ int main(void) {
     CHECK(p_standing_order_stock(NULL, 1) == UINT32_MAX);
     CHECK(p_launches(NULL).count == 0 && p_launches(NULL).launches == NULL);
     p_destroy(h);
+
+    /* Revision 1.6: the active standing orders, each zone centre where the frame puts units. */
+    ScWorld *s = p_create(6);
+    CHECK(s != NULL);
+    CHECK(p_standing_orders(s).count == 0 && p_standing_orders(s).orders == NULL);
+    CHECK(p_set_rules(s, &rules, table, 1));
+    CHECK(p_add_sensor(s, 1, NULL));
+    CHECK(p_spawn(s, &radar) == target);
+    uint64_t watch = p_add_standing_order(s, &sop);
+    ScStandingOrder spent = sop;
+    spent.x = -250.0;
+    spent.y = 125.0;
+    spent.stock = 0;
+    uint64_t idle = p_add_standing_order(s, &spent);
+    CHECK(watch == 1 && idle == 2);
+    p_step(s, 10);
+    CHECK(p_launches(s).count == 1);
+    ScStandingOrders so = p_standing_orders(s);
+    CHECK(so.count == 2 && so.orders != NULL);
+    ScStandingOrderView listed[2];
+    memset(listed, 0, sizeof listed);
+    if (so.count == 2) {
+        memcpy(listed, so.orders, sizeof listed);
+        const ScStandingOrderView *o = &listed[0];
+        CHECK(o->id == watch && o->radius_m == 400.0f);
+        CHECK(o->kinds == 1u << SC_KIND_GROUND_RADAR && o->cooldown_ticks == 30);
+        /* Launched at the end of tick 2: one left, ready again 30 ticks on. */
+        CHECK(o->remaining == 1 && o->stock == 2 && o->ready_tick == 32);
+        CHECK(o->_reserved == 0);
+        ScFrame sf = p_frame(s);
+        int seen = 0;
+        for (uint32_t i = 0; i < sf.count; i++) {
+            if (sf.units[i].id == target) {
+                seen = 1;
+                CHECK(sf.units[i].x == o->x && sf.units[i].y == o->y);
+            }
+        }
+        CHECK(seen);
+        CHECK(listed[1].id == idle && listed[1].x == -250.0f && listed[1].y == 125.0f);
+        CHECK(listed[1].remaining == 0 && listed[1].stock == 0 && listed[1].ready_tick == 0);
+    }
+    /* A restored world lists the same orders. */
+    ScBytes sb = p_save(s);
+    ScWorld *rs = p_restore(sb.data, sb.len);
+    CHECK(rs != NULL);
+    ScStandingOrders rso = p_standing_orders(rs);
+    CHECK(rso.count == 2 && rso.orders != NULL);
+    if (rso.count == 2) {
+        CHECK(memcmp(rso.orders, listed, sizeof listed) == 0);
+    }
+    p_destroy(rs);
+    /* The node moves 15 m along x: each centre shifts by -15 m and stays on the radar. */
+    CHECK(p_command(s, &mv) == 1);
+    p_step(s, 20);
+    so = p_standing_orders(s);
+    CHECK(so.count == 2 && so.orders != NULL);
+    if (so.count == 2) {
+        CHECK(so.orders[0].x == listed[0].x - 15.0f && so.orders[0].y == listed[0].y);
+        CHECK(so.orders[1].x == -265.0f && so.orders[1].y == 125.0f);
+        ScFrame mf = p_frame(s);
+        int moved = 0;
+        for (uint32_t i = 0; i < mf.count; i++) {
+            if (mf.units[i].id == target) {
+                moved = 1;
+                CHECK(mf.units[i].x == so.orders[0].x && mf.units[i].y == so.orders[0].y);
+            }
+        }
+        CHECK(moved);
+    }
+    CHECK(p_cancel_standing_order(s, watch));
+    so = p_standing_orders(s);
+    CHECK(so.count == 1 && so.orders != NULL && so.orders[0].id == idle);
+    CHECK(p_cancel_standing_order(s, idle));
+    CHECK(p_standing_orders(s).count == 0 && p_standing_orders(s).orders == NULL);
+    CHECK(p_standing_orders(NULL).count == 0 && p_standing_orders(NULL).orders == NULL);
+    p_destroy(s);
 
     if (failures) {
         fprintf(stderr, "conformance: %d failure(s)\n", failures);

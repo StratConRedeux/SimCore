@@ -373,6 +373,42 @@ pub struct ScLaunches {
     pub _reserved: u32,
 }
 
+/// An active standing order as the host sees it, for `sc_world_standing_orders` (revision 1.6).
+///
+/// The zone centre is in the frame's coordinates: `f32` metres relative to the command node now,
+/// like [`ScUnitView`], so it moves in the frame as the node moves while the zone stays fixed in
+/// the world.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ScStandingOrderView {
+    pub id: u64,
+    pub x: f32,
+    pub y: f32,
+    pub radius_m: f32,
+    /// As in [`ScStandingOrder::kinds`].
+    pub kinds: u32,
+    /// Launches left.
+    pub remaining: u32,
+    /// Launches it was given.
+    pub stock: u32,
+    /// It can launch again on the tick that ends at this tick count.
+    pub ready_tick: u64,
+    pub cooldown_ticks: u32,
+    pub _reserved: u32,
+}
+
+/// A read-only view of the active standing orders, in id order.
+///
+/// `orders` points into engine-owned memory and is valid until the next
+/// `sc_world_standing_orders` or `sc_world_destroy` on the same world.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct ScStandingOrders {
+    pub orders: *const ScStandingOrderView,
+    pub count: u32,
+    pub _reserved: u32,
+}
+
 const _: () = {
     assert!(core::mem::size_of::<ScStandingOrder>() == 152);
     assert!(core::mem::align_of::<ScStandingOrder>() == 8);
@@ -383,6 +419,14 @@ const _: () = {
     assert!(core::mem::size_of::<ScLaunch>() == 32);
     assert!(core::mem::offset_of!(ScLaunch, pursuer_id) == 16);
     assert!(core::mem::size_of::<ScLaunches>() == 16);
+    assert!(core::mem::size_of::<ScStandingOrderView>() == 48);
+    assert!(core::mem::align_of::<ScStandingOrderView>() == 8);
+    assert!(core::mem::offset_of!(ScStandingOrderView, x) == 8);
+    assert!(core::mem::offset_of!(ScStandingOrderView, radius_m) == 16);
+    assert!(core::mem::offset_of!(ScStandingOrderView, remaining) == 24);
+    assert!(core::mem::offset_of!(ScStandingOrderView, ready_tick) == 32);
+    assert!(core::mem::offset_of!(ScStandingOrderView, cooldown_ticks) == 40);
+    assert!(core::mem::size_of::<ScStandingOrders>() == 16);
     assert!(core::mem::size_of::<ScRules>() == 48);
     assert!(core::mem::offset_of!(ScRules, default_chance) == 24);
     assert!(core::mem::offset_of!(ScRules, exposure_threshold_ticks) == 32);

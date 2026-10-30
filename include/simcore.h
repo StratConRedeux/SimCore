@@ -1,4 +1,4 @@
-/* SimCore C API, header revision 1.5 (ABI version 1). Must match crates/abi/src/lib.rs byte for byte. */
+/* SimCore C API, header revision 1.6 (ABI version 1). Must match crates/abi/src/lib.rs byte for byte. */
 #ifndef SIMCORE_H
 #define SIMCORE_H
 
@@ -258,6 +258,28 @@ typedef struct ScLaunches {
     uint32_t _reserved;
 } ScLaunches;
 
+/* Revision 1.6: an active standing order as the host sees it. 48 bytes. */
+typedef struct ScStandingOrderView {
+    uint64_t id;
+    float x, y;               /* zone centre, f32 metres relative to the command node now, like ScUnitView */
+    float radius_m;
+    uint32_t kinds;
+    uint32_t remaining;       /* launches left */
+    uint32_t stock;           /* launches it was given */
+    uint64_t ready_tick;      /* it can launch again on the tick that ends at this tick count */
+    uint32_t cooldown_ticks;
+    uint32_t _reserved;       /* 0 */
+} ScStandingOrderView;
+
+/* The active standing orders, in id order. `orders` is engine-owned and valid until the next
+   sc_world_standing_orders or sc_world_destroy on the same world. 16 bytes, same shape as
+   ScLaunches. */
+typedef struct ScStandingOrders {
+    const ScStandingOrderView *SC_NULLABLE orders; /* NULL when count is 0 or the call failed. */
+    uint32_t count;
+    uint32_t _reserved;
+} ScStandingOrders;
+
 /* Opaque world handle. All calls on one handle must come from one thread at a time. */
 typedef struct ScWorld ScWorld;
 
@@ -355,6 +377,13 @@ uint32_t sc_world_standing_order_stock(ScWorld *world, uint64_t order_id);
 /* The launches by standing orders during the most recent sc_world_step call, however many
    ticks it ran; empty before the first step and after a restore. */
 ScLaunches sc_world_launches(ScWorld *world);
+
+/* The active standing orders in id order, out-of-stock ones included (revision 1.6). Each zone
+   centre is relative to the command node now, as the frame's units are, so a zone fixed in the
+   world moves in the frame as the node moves. Engine-owned, valid until the next
+   sc_world_standing_orders or sc_world_destroy on the same world. After a restore it lists the
+   same orders as before the save. */
+ScStandingOrders sc_world_standing_orders(ScWorld *world);
 
 #if defined(__clang__)
 #pragma clang assume_nonnull end

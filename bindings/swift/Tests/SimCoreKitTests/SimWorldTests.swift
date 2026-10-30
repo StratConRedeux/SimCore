@@ -323,3 +323,75 @@ private enum Environment {
         #expect(!world.cancelStandingOrder(id))
     }
 }
+
+@Suite struct ContractRevision16Tests {
+    @Test func standingOrderViewLayoutMatchesHeader() {
+        #expect(MemoryLayout<ScStandingOrderView>.size == 48)
+        #expect(MemoryLayout<ScStandingOrderView>.offset(of: \.x) == 8)
+        #expect(MemoryLayout<ScStandingOrderView>.offset(of: \.ready_tick) == 32)
+        #expect(MemoryLayout<ScStandingOrderView>.offset(of: \.cooldown_ticks) == 40)
+        #expect(MemoryLayout<ScStandingOrders>.size == 16)
+    }
+
+    @Test func standingOrdersAreListedWhereTheFrameDrawsAndSurviveARestore() throws {
+        let world = try #require(SimWorld(seed: 3))
+        #expect(world.standingOrders.isEmpty)
+        var rules = ScRules()
+        (rules.detection_max_range_m, rules.sensor_base_range_m) = (20_000, 20_000)
+        (rules.sensor_reference_power_w, rules.exposure_threshold_ticks) = (1, 1)
+        (rules.exposure_cap_ticks, rules.exposure_decay_per_tick) = (1, 1)
+        #expect(world.setRules(rules))
+        #expect(world.addSensor(unit: 1))
+        var radar = ScUnitSpec()
+        (radar.x, radar.y, radar.erp_w, radar.kind) = (3_000, -200, 100, UInt16(SC_KIND_GROUND_RADAR))
+        (radar.affiliation, radar.options) = (SimWorld.affiliationHostile, SimWorld.spawnEmitting)
+        let target = try #require(world.spawn(radar))
+
+        var order = ScStandingOrder()
+        (order.x, order.y, order.radius_m, order.stock, order.cooldown_ticks) = (3_000, -200, 500, 2, 30)
+        order.kinds = 1 << UInt32(SC_KIND_GROUND_RADAR)
+        order.launch.kind = UInt16(SC_KIND_FIXED_WING_DRONE)
+        (order.launch.affiliation, order.launch.options) = (SimWorld.affiliationFriendly, SimWorld.spawnPursuer)
+        (order.launch.speed_mps, order.launch.max_turn_rate_rad_s, order.launch.engagement_radius_m) = (100, 1, 10)
+        let id = try #require(world.addStandingOrder(order))
+        var spent = order
+        (spent.x, spent.stock) = (-1_000, 0)
+        let idle = try #require(world.addStandingOrder(spent))
+
+        world.step()
+        #expect(world.launches.count == 1)
+        let listed = world.standingOrders
+        #expect(listed.map(\.id) == [id, idle], "in id order, out of stock included")
+        let o = try #require(listed.first)
+        #expect((o.radius_m, o.kinds, o.cooldown_ticks) == (500, order.kinds, 30))
+        #expect((o.remaining, o.stock, o.ready_tick) == (1, 2, 31))
+        #expect((listed[1].x, listed[1].y, listed[1].remaining) == (-1_000, -200, 0))
+        let drawn = world.withFrame { units -> (Float, Float, [ScStandingOrderView])? in
+            guard let u = units.first(where: { $0.id == target }) else { return nil }
+            return (u.x, u.y, world.standingOrders)
+        }
+        let (x, y, inside) = try #require(drawn)
+        #expect((o.x, o.y) == (x, y), "the zone centre where the frame puts the radar")
+        #expect(inside.map(\.id) == listed.map(\.id), "readable inside withFrame")
+
+        let restored = try #require(SimWorld(snapshot: world.save()))
+        func bytes(_ views: [ScStandingOrderView]) -> [UInt8] { views.withUnsafeBytes { Array($0) } }
+        #expect(bytes(restored.standingOrders) == bytes(listed), "every field, byte for byte")
+
+        // The node moves 15 m along x: each centre shifts by -15 m and stays on the radar.
+        #expect(world.command(1, .move(x: 15, y: 0, z: 0, speedMps: 15)) != nil)
+        world.step(20)
+        let moved = world.standingOrders
+        #expect(moved.map(\.x) == listed.map { $0.x - 15 })
+        #expect(moved.map(\.y) == listed.map(\.y))
+        #expect((moved[1].x, moved[1].y) == (-1_015, -200))
+        let after = world.withFrame { units in units.first(where: { $0.id == target }).map { ($0.x, $0.y) } }
+        let (ax, ay) = try #require(after)
+        #expect((moved[0].x, moved[0].y) == (ax, ay), "still where the frame puts the radar")
+        #expect(world.cancelStandingOrder(id))
+        #expect(world.standingOrders.map(\.id) == [idle])
+        #expect(world.cancelStandingOrder(idle))
+        #expect(world.standingOrders.isEmpty)
+        #expect(restored.standingOrders.count == 2)
+    }
+}

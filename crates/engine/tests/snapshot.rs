@@ -210,10 +210,12 @@ fn restored_world_continues_identically() {
 
     let (s_a, s_b) = (a.status(), b.status());
     assert_eq!(s_a, s_b);
-    for (id, _) in a.standing_orders() {
-        assert_eq!(a.standing_order(id), b.standing_order(id));
-    }
-    assert_eq!(a.standing_orders().count(), b.standing_orders().count());
+    // The listing a host rediscovers orders from is the same, order by order.
+    assert!(
+        a.standing_orders_with_status()
+            .eq(b.standing_orders_with_status())
+    );
+    assert!(a.standing_orders().count() > 0);
     assert!(bits(a.frame()) == bits(b.frame()));
 
     // Both continue under the same new commands, tick by tick.
