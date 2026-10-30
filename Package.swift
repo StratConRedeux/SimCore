@@ -16,8 +16,8 @@ let package = Package(
         // Exposes the C module `SimCoreC`.
         .binaryTarget(
             name: "SimCore",
-            url: "https://github.com/StratConRedeux/SimCore/releases/download/0.8.1/SimCore.xcframework.zip",
-            checksum: "b5df7b90f1734462fa0968980e66823ccdfb7ba77c86ee7c743a5538ccb9d58f"
+            url: "https://github.com/StratConRedeux/SimCore/releases/download/0.9.0/SimCore.xcframework.zip",
+            checksum: "59489aab423f31ddcc8ba6f837a5b23505cb6211a24943bafabea7a6cee2938b"
         ),
         // Same sources as bindings/swift; nothing under crates/, target/ or build/ is read.
         .target(
