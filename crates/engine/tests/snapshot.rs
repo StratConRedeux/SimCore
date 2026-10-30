@@ -1,6 +1,9 @@
 //! Save and restore: a restored world continues bit for bit like the original, and damaged or
 //! foreign bytes are rejected without panicking. All numbers are test fixtures.
 
+mod common;
+
+use common::{Exercised, rich_world, script};
 use simcore_abi::ScUnitView;
 use simcore_abi::affiliation::{FRIENDLY, HOSTILE};
 use simcore_engine::{
@@ -248,6 +251,46 @@ fn restored_world_continues_identically() {
     assert!(launches > 0);
 }
 
+/// A rich world run three ways under the same script: never saved, saved every chunk, and
+/// saved and restored every few ticks at varying phases (mid-chunk, with commands in flight,
+/// pursuers closing, exposures building and cooldowns running). All three stay byte-identical.
+#[test]
+fn save_restore_mid_run_is_invisible() {
+    let (mut plain, mut saved, mut restored) = (rich_world(21), rich_world(21), rich_world(21));
+    let mut rngs = [Pcg32::new(21, 1), Pcg32::new(21, 1), Pcg32::new(21, 1)];
+    let mut exercised = Exercised::default();
+    let (mut restores, mut in_flight) = (0, 0);
+    for chunk in 0..40u32 {
+        script(&mut plain, &mut rngs[0]);
+        script(&mut saved, &mut rngs[1]);
+        script(&mut restored, &mut rngs[2]);
+        for t in 0..10u32 {
+            plain.step(1);
+            saved.step(1);
+            restored.step(1);
+            assert_eq!(plain.engagement_events(), restored.engagement_events());
+            assert_eq!(
+                plain.standing_order_launches(),
+                restored.standing_order_launches()
+            );
+            exercised.record(&plain);
+            if (chunk * 10 + t) % 7 == 3 {
+                in_flight += usize::from(restored.pending_commands() > 0);
+                restored = Sim::restore(restored.save()).expect("restores");
+                restores += 1;
+            }
+        }
+        assert!(saved.save() == restored.save(), "chunk {chunk}");
+    }
+    assert!(
+        plain.save() == saved.save(),
+        "saving does not change the run"
+    );
+    println!("{restores} restores ({in_flight} with commands in flight), {exercised:?}");
+    exercised.assert_rich();
+    assert!(in_flight > 0);
+}
+
 #[test]
 fn restore_of_a_fresh_world() {
     let mut a = Sim::new(3);
@@ -416,15 +459,63 @@ fn rejects_foreign_and_damaged_bytes() {
     }
 }
 
+/// A snapshot of the rich world mid-run: units of every kind with cycles, sensors and
+/// exposure, pursuers, moves and commands in flight, standing orders part-way through stock.
+fn rich_snapshot() -> Vec<u8> {
+    let mut sim = rich_world(8);
+    let mut rng = Pcg32::new(8, 8);
+    for _ in 0..6 {
+        script(&mut sim, &mut rng);
+        sim.step(9);
+    }
+    script(&mut sim, &mut rng);
+    assert!(sim.pending_commands() > 0);
+    sim.save().to_vec()
+}
+
+/// What an accepted tampered snapshot must satisfy. It is canonical: saving the restored world
+/// gives back exactly the input, so no field was read leniently or dropped (with one known
+/// exception: `Pcg32::from_state` forces an even RNG increment odd instead of rejecting it).
+/// And it runs, and (with `round_trip`) what it saves after running restores to the same bytes.
+/// A restore costs far more than a step or a save, so the exhaustive test leaves that out.
+fn check_accepted(mut sim: Sim, input: &[u8], round_trip: bool) {
+    // Payload: tick, next id, last command id (u64 each), two u32 counters, RNG state, then
+    // the RNG increment, whose low byte is here.
+    const RNG_INCREMENT: usize = 24 + 8 * 3 + 4 * 2 + 8;
+    let mut expected = input.to_vec();
+    expected[RNG_INCREMENT] |= 1;
+    reseal(&mut expected);
+    assert!(
+        sim.save() == &expected[..],
+        "an accepted snapshot is canonical"
+    );
+    sim.step(3);
+    let _ = sim.frame();
+    let _ = sim.status();
+    let resaved = sim.save().to_vec();
+    if round_trip {
+        let mut again = Sim::restore(&resaved).expect("a resaved world restores");
+        assert!(again.save() == &resaved[..], "and saves to the same bytes");
+    }
+}
+
 #[test]
 fn tampered_payloads_never_panic() {
     // With the checksum recomputed, damage reaches the parser: it must reject or accept, never
     // panic, and anything accepted must run.
-    let good = small_world();
+    for (name, good, rounds) in [
+        ("small", small_world(), 20_000),
+        ("rich", rich_snapshot(), 4_000),
+    ] {
+        tamper_randomly(name, &good, rounds);
+    }
+}
+
+fn tamper_randomly(name: &str, good: &[u8], rounds: u32) {
     let mut rng = Pcg32::new(1, 1);
     let (mut accepted, mut rejected) = (0, 0);
-    for round in 0..20_000 {
-        let mut v = good.clone();
+    for round in 0..rounds {
+        let mut v = good.to_vec();
         let flips = 1 + rng.below(4);
         for _ in 0..flips {
             let i = 24 + rng.below((v.len() - 24) as u32) as usize;
@@ -436,12 +527,9 @@ fn tampered_payloads_never_panic() {
         }
         reseal(&mut v);
         match Sim::restore(&v) {
-            Ok(mut sim) => {
+            Ok(sim) => {
                 accepted += 1;
-                sim.step(3);
-                let _ = sim.frame();
-                let _ = sim.status();
-                let _ = sim.save();
+                check_accepted(sim, &v, true);
             }
             Err(e) => {
                 rejected += 1;
@@ -449,8 +537,44 @@ fn tampered_payloads_never_panic() {
             }
         }
     }
-    println!("tampered: {accepted} accepted, {rejected} rejected");
+    println!("{name}, tampered: {accepted} accepted, {rejected} rejected");
     assert!(rejected > 0);
+}
+
+#[test]
+fn every_payload_byte_tampered() {
+    // Each payload byte of a rich snapshot, in turn, set to 0, to 0xff or with its top bit
+    // flipped (cycling, so every field sees each), the checksum recomputed: every result is
+    // rejected as invalid or is a sound world.
+    let good = rich_snapshot();
+    let (mut accepted, mut rejected) = (0, 0);
+    for i in 24..good.len() {
+        let mut v = good.clone();
+        v[i] = match i % 3 {
+            0 => 0,
+            1 => 0xff,
+            _ => v[i] ^ 0x80,
+        };
+        if v[i] == good[i] {
+            v[i] ^= 0x80;
+        }
+        reseal(&mut v);
+        match Sim::restore(&v) {
+            Ok(sim) => {
+                accepted += 1;
+                check_accepted(sim, &v, false);
+            }
+            Err(e) => {
+                rejected += 1;
+                assert!(matches!(e, SnapshotError::Invalid(_)), "byte {i}: {e:?}");
+            }
+        }
+    }
+    println!(
+        "{} bytes: {accepted} accepted, {rejected} rejected",
+        good.len()
+    );
+    assert!(rejected > 0 && accepted > 0);
 }
 
 #[test]

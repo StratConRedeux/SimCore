@@ -765,6 +765,9 @@ fn determinism_with_rules() {
     }
     let fa = bits(a.frame());
     assert!(fa == bits(b.frame()), "bitwise-identical after 600 ticks");
+    // Hidden state too (exposure, RNG, pursuit), not only what the frame shows.
+    let saved = a.save().to_vec();
+    assert!(saved == b.save(), "identical saves after 600 ticks");
     assert_eq!(a.unit_count(), b.unit_count());
     assert_eq!(fa.len(), a.unit_count() as usize);
     let detected = a
@@ -787,6 +790,7 @@ fn determinism_with_rules() {
         c.step(15);
     }
     assert!(bits(c.frame()) == fa);
+    assert!(c.save() == &saved[..]);
     let mut d = scenario(6);
     d.step(600);
     assert!(bits(d.frame()) != fa);

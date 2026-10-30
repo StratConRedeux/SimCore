@@ -1,6 +1,8 @@
 //! The signal heatmap's exact and far-field modes: equality with the exact sum, error bounds,
 //! determinism and allocations. All numbers are test fixtures.
 
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
@@ -259,20 +261,62 @@ fn far_field_error_is_bounded_for_adversarial_layouts() {
     check_far_field("straddling block", &mut sim, 50.0, (64, 64), 8_000.0);
 }
 
+/// `emitters` plus the rich world's mix: every kind, duty cycles, movers, sensors, pursuers
+/// and standing orders, so the map's inputs change from tick to tick.
+fn mixed(seed: u64) -> Sim {
+    let mut sim = emitters(seed, 3_000, 3_000);
+    common::activate(&mut sim, seed);
+    common::populate(&mut sim, seed);
+    sim
+}
+
 #[test]
 fn far_field_is_deterministic() {
-    let (mut a, mut b) = (emitters(4, 4_000, 4_000), emitters(4, 4_000, 4_000));
-    for theta in [1.0, HeatmapSpec::DEFAULT_THETA, 10.0] {
-        let s = spec(60.0, (90, 70), 9_000.0, theta);
-        let first = hash(a.build_heatmap(s, HOSTILE).values());
-        assert_eq!(first, hash(b.build_heatmap(s, HOSTILE).values()));
-        assert_eq!(first, hash(a.build_heatmap(s, HOSTILE).values()));
-        // Another map in between leaves no trace.
-        a.build_heatmap(spec(500.0, (16, 16), 30_000.0, theta), HOSTILE);
-        assert_eq!(first, hash(a.build_heatmap(s, HOSTILE).values()));
+    let (mut a, mut b) = (mixed(4), mixed(4));
+    let (mut ra, mut rb) = (Pcg32::new(4, 4), Pcg32::new(4, 4));
+    let mut seen = std::collections::BTreeSet::new();
+    let mut exercised = common::Exercised::default();
+    for round in 0..4 {
+        common::script(&mut a, &mut ra);
+        common::script(&mut b, &mut rb);
+        for _ in 0..40 {
+            a.step(1);
+            exercised.record(&a);
+        }
+        b.step(40);
+        // A restored copy draws the same maps. (Saving `a` releases its removed units; `b`
+        // keeps them until it next spawns.)
+        let mut r = Sim::restore(a.save()).unwrap();
+        for theta in [HeatmapSpec::EXACT, 1.0, HeatmapSpec::DEFAULT_THETA, 10.0] {
+            for side in [HOSTILE, FRIENDLY] {
+                let s = spec(60.0, (90, 70), 9_000.0, theta);
+                let first = hash(a.build_heatmap(s, side).values());
+                assert_eq!(
+                    first,
+                    hash(b.build_heatmap(s, side).values()),
+                    "round {round}"
+                );
+                assert_eq!(
+                    first,
+                    hash(r.build_heatmap(s, side).values()),
+                    "round {round}"
+                );
+                assert_eq!(first, hash(a.build_heatmap(s, side).values()));
+                // Another map in between leaves no trace.
+                a.build_heatmap(spec(500.0, (16, 16), 30_000.0, theta), side);
+                assert_eq!(first, hash(a.build_heatmap(s, side).values()));
+                seen.insert(first);
+            }
+        }
     }
+    println!("{exercised:?}");
+    assert!(exercised.successes > 0, "units are removed between maps");
+    // The maps change as the world runs (cycles, motion, removals), so the comparisons above
+    // compared different inputs each round.
+    assert!(seen.len() >= 4 * 4, "{} distinct maps", seen.len());
     let s = spec(60.0, (90, 70), 9_000.0, HeatmapSpec::DEFAULT_THETA);
-    let mut c = emitters(5, 4_000, 4_000);
+    let mut c = mixed(5);
+    c.step(160);
     assert_ne!(
         hash(a.build_heatmap(s, HOSTILE).values()),
         hash(c.build_heatmap(s, HOSTILE).values())

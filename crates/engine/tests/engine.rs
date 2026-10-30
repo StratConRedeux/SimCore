@@ -1,5 +1,10 @@
+mod common;
+
+use common::{Exercised, activate, populate, rich_world, script};
 use simcore_abi::{ScUnitView, flags};
-use simcore_engine::{EmsProfile, Position, Sim, TICKS_PER_SECOND, UnitSpec, Velocity, kind};
+use simcore_engine::{
+    EmsProfile, Pcg32, Position, Sim, TICKS_PER_SECOND, UnitSpec, Velocity, kind,
+};
 
 /// Every field of a view as raw bits, so float comparisons are bitwise.
 fn bits(frame: &[ScUnitView]) -> Vec<[u64; 8]> {
@@ -31,26 +36,46 @@ fn unit(position: Position, velocity: Velocity) -> UnitSpec {
     }
 }
 
+/// The dummy world with the rules switched on: sensors, pursuers drawing outcome rolls,
+/// standing orders and link rules on top of 5000 duty-cycled movers.
+fn active_dummy(seed: u64) -> Sim {
+    let mut sim = Sim::new_dummy(seed, 5000);
+    activate(&mut sim, seed);
+    populate(&mut sim, seed);
+    sim
+}
+
 #[test]
 fn determinism() {
-    let mut a = Sim::new_dummy(42, 5000);
-    let mut b = Sim::new_dummy(42, 5000);
-    a.step(300);
-    b.step(300);
+    let (mut a, mut b) = (active_dummy(42), active_dummy(42));
+    let at_0 = a.save().to_vec();
+    let mut exercised = Exercised::default();
+    for _ in 0..300 {
+        a.step(1);
+        b.step(1);
+        assert_eq!(a.engagement_events(), b.engagement_events());
+        exercised.record(&a);
+    }
     assert_eq!(a.tick(), 300);
     let fa = bits(a.frame());
-    let fb = bits(b.frame());
-    assert_eq!(fa.len(), 5001);
-    assert!(fa == fb, "same seed must give bitwise-identical frames");
+    assert_eq!(fa.len(), a.unit_count() as usize);
+    assert!(
+        fa == bits(b.frame()),
+        "same seed must give bitwise-identical frames"
+    );
+    // The hidden state too: exposure, RNG, cooldowns, moves.
+    let saved = a.save().to_vec();
+    assert!(saved == b.save(), "same seed must give identical saves");
+    exercised.assert_rich();
 
     // Stepping in different chunk sizes is the same simulation.
-    let mut c = Sim::new_dummy(42, 5000);
+    let mut c = active_dummy(42);
     for _ in 0..100 {
         c.step(3);
     }
-    assert!(bits(c.frame()) == fa);
+    assert!(c.save() == &saved[..]);
 
-    let mut d = Sim::new_dummy(43, 5000);
+    let mut d = active_dummy(43);
     d.step(300);
     assert!(
         bits(d.frame()) != fa,
@@ -63,7 +88,7 @@ fn determinism() {
         .iter()
         .filter(|u| u.flags & flags::EMITTING != 0)
         .count();
-    let mut e = Sim::new_dummy(42, 5000);
+    let mut e = Sim::restore(&at_0).unwrap();
     let emitting_at_0 = e
         .frame()
         .iter()
@@ -71,6 +96,45 @@ fn determinism() {
         .count();
     assert!(emitting_now > 0 && emitting_at_0 > 0);
     assert!(bits(e.frame()) != fa);
+}
+
+/// Two runs of the rich world under the same script, one stepped tick by tick and one in
+/// chunks, save to identical bytes at every chunk; a different seed for the engagement rolls
+/// alone (same layout) changes the outcome.
+#[test]
+fn determinism_of_a_rich_world() {
+    let (mut a, mut b) = (rich_world(7), rich_world(7));
+    let (mut ra, mut rb) = (Pcg32::new(7, 2), Pcg32::new(7, 2));
+    let mut exercised = Exercised::default();
+    for chunk in 0..30 {
+        script(&mut a, &mut ra);
+        script(&mut b, &mut rb);
+        let mut events = Vec::new();
+        for _ in 0..12 {
+            a.step(1);
+            exercised.record(&a);
+            events.extend_from_slice(a.engagement_events());
+        }
+        b.step(12);
+        assert_eq!(events, b.engagement_events(), "chunk {chunk}");
+        assert!(a.save() == b.save(), "chunk {chunk}");
+    }
+    println!("{exercised:?}");
+    exercised.assert_rich();
+
+    // Same layout and script, different engagement seed.
+    let mut c = Sim::new(8);
+    activate(&mut c, 7);
+    populate(&mut c, 7);
+    let mut rc = Pcg32::new(7, 2);
+    for _ in 0..30 {
+        script(&mut c, &mut rc);
+        c.step(12);
+    }
+    assert!(
+        bits(c.frame()) != bits(a.frame()),
+        "the engagement rolls decide the outcome"
+    );
 }
 
 #[test]
