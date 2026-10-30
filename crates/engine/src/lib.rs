@@ -134,6 +134,8 @@ pub struct Sim {
     contact_query: ContactQuery,
     pursuit_query: PursuitQuery,
     launch_plan: Vec<Launch>,
+    /// Host tags ([`Sim::set_tag`]): nonzero only, of live units only.
+    tags: std::collections::BTreeMap<StableId, u64>,
 }
 
 impl Sim {
@@ -217,6 +219,7 @@ impl Sim {
             contact_query,
             pursuit_query,
             launch_plan: Vec::new(),
+            tags: std::collections::BTreeMap::new(),
         }
     }
 
@@ -427,6 +430,38 @@ impl Sim {
         Ok(seq)
     }
 
+    /// Applies `order` to unit `unit` at once, before the next tick, whatever its affiliation:
+    /// for hosts that drive another side or scripted units. The same type and value checks as
+    /// [`Sim::command`] apply, but there is no link delay, nothing is queued, and neither
+    /// [`Sim::pending_commands`] nor the dropped count changes.
+    pub fn order(&mut self, unit: StableId, order: Order) -> Result<(), CommandError> {
+        orders::validate_order(&self.world, unit, &order)?;
+        // Checked just now, so the unit (and a retarget's target) exists.
+        let applied = orders::apply(&mut self.world, unit, order);
+        debug_assert!(applied, "a validated order applies");
+        Ok(())
+    }
+
+    /// Sets the host's tag on live unit `unit`; 0 clears it. The engine never reads tags. They
+    /// are saved with the world and cleared when the unit is removed. `false` if the unit does
+    /// not exist.
+    pub fn set_tag(&mut self, unit: StableId, tag: u64) -> bool {
+        if !self.contains(unit) {
+            return false;
+        }
+        if tag == 0 {
+            self.tags.remove(&unit);
+        } else {
+            self.tags.insert(unit, tag);
+        }
+        true
+    }
+
+    /// The host's tag on unit `unit`: 0 if unset, or if the unit does not exist.
+    pub fn tag(&self, unit: StableId) -> u64 {
+        self.tags.get(&unit).copied().unwrap_or(0)
+    }
+
     /// The link delay, in ticks, of a command issued now to unit `id`, if it exists.
     pub fn link_delay(&mut self, id: StableId) -> Option<u32> {
         let at = self.position(id)?;
@@ -562,7 +597,17 @@ impl Sim {
             // Engagement resolution removes units, so it runs with exclusive world access as
             // the last stage of the tick.
             let origin = self.command_node_position();
+            let resolved = self.engagements.events.len();
             self.engagements.resolve(&mut self.world, tick, origin);
+            // Removed units lose their tags on the tick they go.
+            if !self.tags.is_empty() {
+                for e in &self.engagements.events[resolved..] {
+                    self.tags.remove(&e.pursuer);
+                    if e.target_removed {
+                        self.tags.remove(&e.target);
+                    }
+                }
+            }
             self.world.resource_mut::<SimClock>().tick = tick;
             // Launches spawn units, which needs `&mut self`, so standing orders come last too.
             if self.standing.any_ready(tick) {

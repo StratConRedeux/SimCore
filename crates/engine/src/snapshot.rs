@@ -6,7 +6,7 @@
 //! ```text
 //! header:  b"SCSN"  format_version u32  payload_len u64  fnv1a64(payload) u64
 //! payload: clock, ids, counters, PRNG; Rules; LinkRules; Terrain; units; moves; pending commands;
-//!          standing orders (format 2 on)
+//!          standing orders (format 2 on); host tags (format 3 on)
 //! ```
 //!
 //! Units are written in stable id order, so the bytes are canonical: saving a restored world
@@ -25,10 +25,10 @@ use crate::{
     SimClock, StableId, StandingOrder, StandingOrderStatus, Terrain, UnitKind, UnitSpec, Velocity,
 };
 
-/// Bumped whenever the payload layout changes. Format 2 added standing orders; format 1, which
-/// is format 2 without them, still restores (with none). Older formats are rejected, not
-/// migrated, until a release needs to read them.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// Bumped whenever the payload layout changes. Format 2 added standing orders and format 3 host
+/// tags, each as a trailing section; older formats, without them, still restore (with no
+/// standing orders, and every tag 0). Formats this build did not write are rejected.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 const MAGIC: &[u8; 4] = b"SCSN";
 const HEADER_LEN: usize = 4 + 4 + 8 + 8;
@@ -379,6 +379,14 @@ impl Sim {
             w.f64(q.engagement_radius_m);
             w.u16(q.outcome_class);
         }
+
+        // Host tags: nonzero ones of live units, in id order. Removed units lost theirs on
+        // the tick they went.
+        w.len(self.tags.len());
+        for (id, &tag) in &self.tags {
+            w.u64(id.0);
+            w.u64(tag);
+        }
     }
 
     /// Rebuilds a world from [`Sim::save`] output. It continues exactly as the saved world
@@ -406,6 +414,9 @@ impl Sim {
         if version >= 2 {
             read_standing_orders(&mut r, &mut sim)?;
         }
+        if version >= 3 {
+            read_tags(&mut r, &mut sim)?;
+        }
         if !r.0.is_empty() {
             return Err(SnapshotError::Invalid("trailing bytes"));
         }
@@ -418,9 +429,11 @@ impl Sim {
 const MAX_DELAY_TICKS: u64 = u32::MAX as u64;
 
 /// Whether a saved move or queued command could have been accepted: the checks of
-/// `orders::validate` that still hold after issue. Its unit may be gone (the order is then
-/// dropped on the next tick, as in the saved world), and so may a retarget's target.
-fn consistent(sim: &Sim, unit: StableId, order: &Order) -> bool {
+/// `orders::validate` (with `require_friendly`, for a queued command) or of
+/// `orders::validate_order` (without, for a move, which a direct order can give any unit) that
+/// still hold after issue. Its unit may be gone (the order is then dropped on the next tick,
+/// as in the saved world), and so may a retarget's target.
+fn consistent(sim: &Sim, unit: StableId, order: &Order, require_friendly: bool) -> bool {
     let values_ok = match *order {
         Order::Move {
             destination: d,
@@ -446,7 +459,7 @@ fn consistent(sim: &Sim, unit: StableId, order: &Order) -> bool {
         Order::Retarget { .. } => pursuer,
         Order::Emissions { .. } => true,
     };
-    values_ok && friendly && type_ok
+    values_ok && (friendly || !require_friendly) && type_ok
 }
 
 fn read_payload(r: &mut R) -> Parsed<Sim> {
@@ -644,7 +657,7 @@ fn read_payload(r: &mut R) -> Parsed<Sim> {
             destination,
             speed_mps,
         };
-        if !consistent(&sim, unit, &order) {
+        if !consistent(&sim, unit, &order, false) {
             return Err(SnapshotError::Invalid("move"));
         }
         moves.push(Move {
@@ -678,7 +691,8 @@ fn read_payload(r: &mut R) -> Parsed<Sim> {
         let key = (deliver_tick, seq);
         let in_order = pending.last().is_none_or(|q| (q.deliver_tick, q.seq) > key);
         let due = (tick..=tick + MAX_DELAY_TICKS).contains(&deliver_tick);
-        if !in_order || !due || seq == 0 || seq > last_seq || !consistent(&sim, unit, &order) {
+        if !in_order || !due || seq == 0 || seq > last_seq || !consistent(&sim, unit, &order, true)
+        {
             return Err(SnapshotError::Invalid("pending commands"));
         }
         pending.push(Pending {
@@ -776,5 +790,19 @@ fn read_standing_orders(r: &mut R, sim: &mut Sim) -> Parsed<()> {
     }
     sim.standing.last_id = last_id;
     sim.standing.active = active;
+    Ok(())
+}
+
+fn read_tags(r: &mut R, sim: &mut Sim) -> Parsed<()> {
+    let n = r.len(16, "tag count")?;
+    let mut last = 0;
+    for _ in 0..n {
+        let (id, tag) = (r.u64()?, r.u64()?);
+        // Strictly increasing ids of live units and nonzero tags, as `save` writes them.
+        if id <= last || tag == 0 || !sim.set_tag(StableId(id), tag) {
+            return Err(SnapshotError::Invalid("tags"));
+        }
+        last = id;
+    }
     Ok(())
 }

@@ -367,24 +367,30 @@ fn small_order() -> StandingOrder {
     }
 }
 
+/// `bytes` cut to `len` and relabelled as format `version`, length and checksum fixed up.
+fn older_format(bytes: &[u8], len: usize, version: u32) -> Vec<u8> {
+    let mut v = bytes[..len].to_vec();
+    v[4..8].copy_from_slice(&version.to_le_bytes());
+    let payload_len = (v.len() - 24) as u64;
+    v[8..16].copy_from_slice(&payload_len.to_le_bytes());
+    reseal(&mut v);
+    v
+}
+
 #[test]
 fn format_1_snapshots_restore_with_no_standing_orders() {
-    // Format 1 is format 2 without the trailing standing-order section: an empty one is the
-    // last id (8 bytes) and a count (4 bytes).
+    // Format 1 is format 3 without the trailing standing-order section (an empty one is the
+    // last id, 8 bytes, and a count, 4 bytes) and the tag section (an empty one is a count).
     let mut sim = Sim::new_dummy(4, 50);
     sim.step(20);
-    let v2 = sim.save().to_vec();
-    let mut v1 = v2[..v2.len() - 12].to_vec();
-    v1[4..8].copy_from_slice(&1u32.to_le_bytes());
-    let payload_len = (v1.len() - 24) as u64;
-    v1[8..16].copy_from_slice(&payload_len.to_le_bytes());
-    reseal(&mut v1);
+    let v3 = sim.save().to_vec();
+    let v1 = older_format(&v3, v3.len() - 16, 1);
     let mut restored = Sim::restore(&v1).expect("format 1 restores");
-    assert_eq!(restored.save(), &v2[..], "and saves as format 2");
+    assert_eq!(restored.save(), &v3[..], "and saves as format 3");
     assert_eq!(restored.standing_orders().count(), 0);
 
-    // A format-1 header on format-2 bytes leaves the section over.
-    let mut v = v2.clone();
+    // A format-1 header on format-3 bytes leaves the sections over.
+    let mut v = v3.clone();
     v[4..8].copy_from_slice(&1u32.to_le_bytes());
     reseal(&mut v);
     assert_eq!(
@@ -395,10 +401,10 @@ fn format_1_snapshots_restore_with_no_standing_orders() {
 
 #[test]
 fn impossible_standing_orders_are_rejected() {
-    // The standing-order section is last; the last order's fields end the payload:
-    // ..., speed, turn, lead, radius (f64 each), outcome class (u16).
+    // The standing-order section is followed only by the (empty) tag count; the last order's
+    // fields end before it: ..., speed, turn, lead, radius (f64 each), outcome class (u16).
     let good = small_world();
-    let n = good.len();
+    let n = good.len() - 4;
     let restored = Sim::restore(&good).unwrap();
     assert_eq!(
         restored
@@ -649,4 +655,270 @@ fn many_moves_restore_in_linear_time() {
     big_sim.step(5);
     b.step(5);
     assert!(bits(big_sim.frame()) == bits(b.frame()));
+}
+
+/// A world driven partly by direct orders: a hostile unit part-way through a move, a silenced
+/// duty-cycled hostile emitter, a retargeted hostile pursuer, and a friendly command in flight.
+fn directed_world() -> Sim {
+    let mut sim = Sim::new(5);
+    sim.set_link_rules(LinkRules {
+        base_delay_ticks: 30,
+        ..LinkRules::default()
+    });
+    let mover = sim.spawn_unit(unit(HOSTILE, kind::GROUND_VEHICLE, p(0.0, 40.0, 0.0), 0.0));
+    let radar = sim.spawn_unit(UnitSpec {
+        cycle: Some(EmitterCycle {
+            on_ticks: 3,
+            off_ticks: 2,
+            phase: 1,
+        }),
+        ..unit(HOSTILE, kind::GROUND_RADAR, p(300.0, 0.0, 0.0), 50.0)
+    });
+    let friend = sim.spawn_unit(unit(
+        FRIENDLY,
+        kind::GROUND_VEHICLE,
+        p(-50.0, 0.0, 0.0),
+        0.0,
+    ));
+    let other = sim.spawn_unit(unit(
+        FRIENDLY,
+        kind::GROUND_VEHICLE,
+        p(-900.0, 0.0, 0.0),
+        0.0,
+    ));
+    let seeker = sim.spawn_pursuer(
+        unit(HOSTILE, kind::FIXED_WING_DRONE, p(2000.0, 0.0, 50.0), 0.0),
+        Pursuer {
+            target: friend,
+            speed: 20.0,
+            max_turn_rate: 1.0,
+            lead: 0.0,
+            engagement_radius_m: 1.0,
+            outcome_class: 0,
+        },
+    );
+    sim.order(
+        mover,
+        Order::Move {
+            destination: p(400.0, 40.0, 0.0),
+            speed_mps: 6.0,
+        },
+    )
+    .unwrap();
+    sim.order(radar, Order::Emissions { radiate: false })
+        .unwrap();
+    sim.order(seeker, Order::Retarget { target: other })
+        .unwrap();
+    sim.step(10);
+    sim.command(friend, Order::Halt).unwrap();
+    sim
+}
+
+#[test]
+fn directed_hostiles_survive_save_restore() {
+    let mut a = directed_world();
+    let saved = a.save().to_vec();
+    // Before revision 1.7 a saved move had to be a friendly unit's: this was Invalid("move").
+    let mut b = Sim::restore(&saved).expect("a world with a hostile mid-move restores");
+    assert!(b.save() == &saved[..], "canonical");
+    for t in 0..80 {
+        a.step(1);
+        b.step(1);
+        assert!(bits(a.frame()) == bits(b.frame()), "tick {t}");
+        assert_eq!(a.status(), b.status(), "tick {t}");
+        let radar = b.frame().iter().find(|u| u.id == 3).unwrap().flags;
+        assert_eq!(radar & simcore_abi::flags::EMITTING, 0, "still silent");
+    }
+    assert!(a.save() == b.save());
+    assert!((b.position(StableId(2)).unwrap().x - 90.0 * 6.0 / 15.0).abs() < 1e-9);
+}
+
+/// Where `needle` starts in `hay`; it must occur once.
+fn find_once(hay: &[u8], needle: &[u8]) -> usize {
+    let at: Vec<_> = hay
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, w)| *w == needle)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(at.len(), 1, "{needle:?}");
+    at[0]
+}
+
+#[test]
+fn a_queued_command_to_a_hostile_is_still_rejected() {
+    // Direct orders are never queued, so a pending command must still be a friendly unit's.
+    let mut sim = directed_world();
+    let good = sim.save().to_vec();
+    // The pending halt to unit 4: deliver tick 40, command id 1, unit 4, order tag 2.
+    let mut entry = Vec::new();
+    for v in [40u64, 1, 4] {
+        entry.extend_from_slice(&v.to_le_bytes());
+    }
+    entry.push(2);
+    let at = find_once(&good, &entry) + 16;
+    let mut v = good.clone();
+    v[at..at + 8].copy_from_slice(&2u64.to_le_bytes()); // the hostile mover
+    reseal(&mut v);
+    assert_eq!(
+        Sim::restore(&v).err(),
+        Some(SnapshotError::Invalid("pending commands"))
+    );
+}
+
+/// Units 2 to 5, with tags on 2 (5) and 4 (9), saved.
+fn tagged_world() -> (Sim, Vec<u8>) {
+    let mut sim = Sim::new(2);
+    for x in 0..4 {
+        sim.spawn_unit(unit(
+            HOSTILE,
+            kind::GROUND_VEHICLE,
+            p(f64::from(x), 0.0, 0.0),
+            0.0,
+        ));
+    }
+    assert!(sim.set_tag(StableId(2), 5));
+    assert!(sim.set_tag(StableId(4), 9));
+    let bytes = sim.save().to_vec();
+    (sim, bytes)
+}
+
+#[test]
+fn tags_are_host_data_saved_with_the_world() {
+    let (mut sim, bytes) = tagged_world();
+    assert_eq!(sim.tag(StableId(3)), 0, "unset is 0");
+    assert_eq!(sim.tag(StableId(99)), 0, "unknown is 0");
+    assert!(!sim.set_tag(StableId(99), 1), "unknown unit");
+    assert!(!sim.set_tag(StableId(0), 1));
+    assert_eq!(sim.tag(StableId(99)), 0);
+    // The section is last: count, then (id, tag) in id order.
+    let mut tail = 2u32.to_le_bytes().to_vec();
+    for v in [2u64, 5, 4, 9] {
+        tail.extend_from_slice(&v.to_le_bytes());
+    }
+    assert!(bytes.ends_with(&tail));
+
+    let mut r = Sim::restore(&bytes).unwrap();
+    assert!(r.save() == &bytes[..]);
+    assert_eq!((r.tag(StableId(2)), r.tag(StableId(3))), (5, 0));
+    assert_eq!(r.tag(StableId(4)), 9);
+    // Tags do not touch the simulation.
+    sim.step(30);
+    r.step(30);
+    assert!(bits(sim.frame()) == bits(r.frame()));
+
+    // Setting 0 clears; clearing everything gives an empty section.
+    assert!(sim.set_tag(StableId(2), 0) && sim.set_tag(StableId(4), 0));
+    assert!(sim.set_tag(StableId(3), 0), "clearing an unset tag is fine");
+    assert_eq!(sim.tag(StableId(2)), 0);
+    assert!(sim.save().ends_with(&0u32.to_le_bytes()));
+    assert!(Sim::new(2).save().ends_with(&0u32.to_le_bytes()));
+
+    // Older formats, which have no tag section, restore with every tag 0.
+    let v2 = older_format(&bytes, bytes.len() - tail.len(), 2);
+    let mut old = Sim::restore(&v2).expect("format 2 restores");
+    assert_eq!((old.tag(StableId(2)), old.tag(StableId(4))), (0, 0));
+    assert!(old.save().ends_with(&0u32.to_le_bytes()));
+    let v1 = older_format(&bytes, bytes.len() - tail.len() - 12, 1);
+    assert_eq!(Sim::restore(&v1).unwrap().tag(StableId(2)), 0);
+}
+
+#[test]
+fn impossible_tags_are_rejected() {
+    let (_, good) = tagged_world();
+    let n = good.len();
+    // The two entries: (2, 5) at n - 32 and (4, 9) at n - 16.
+    let entries = |a: (u64, u64), b: (u64, u64)| {
+        let mut v = good.clone();
+        for (at, (id, tag)) in [(n - 32, a), (n - 16, b)] {
+            v[at..at + 8].copy_from_slice(&id.to_le_bytes());
+            v[at + 8..at + 16].copy_from_slice(&tag.to_le_bytes());
+        }
+        reseal(&mut v);
+        v
+    };
+    assert!(Sim::restore(&entries((2, 5), (4, 9))).is_ok());
+    assert!(Sim::restore(&entries((3, u64::MAX), (5, 1))).is_ok());
+    for (v, what) in [
+        (entries((2, 5), (6, 9)), "unknown id"),
+        (entries((0, 5), (4, 9)), "id 0"),
+        (entries((2, 5), (u64::MAX, 9)), "huge id"),
+        (entries((2, 5), (2, 9)), "duplicate"),
+        (entries((4, 9), (2, 5)), "unsorted"),
+        (entries((2, 0), (4, 9)), "zero tag"),
+        (entries((2, 5), (4, 0)), "zero tag"),
+    ] {
+        assert_eq!(
+            Sim::restore(&v).err(),
+            Some(SnapshotError::Invalid("tags")),
+            "{what}"
+        );
+    }
+    // A count beyond the bytes left.
+    let mut v = good.clone();
+    v[n - 36..n - 32].copy_from_slice(&3u32.to_le_bytes());
+    reseal(&mut v);
+    assert_eq!(
+        Sim::restore(&v).err(),
+        Some(SnapshotError::Invalid("tag count"))
+    );
+    let mut v = good.clone();
+    v[n - 36..n - 32].copy_from_slice(&1u32.to_le_bytes());
+    reseal(&mut v);
+    assert_eq!(
+        Sim::restore(&v).err(),
+        Some(SnapshotError::Invalid("trailing bytes"))
+    );
+}
+
+#[test]
+fn a_removed_unit_loses_its_tag_on_the_tick_it_goes() {
+    let mut sim = Sim::new(3);
+    sim.set_rules(Rules {
+        outcomes: OutcomeTable::new(1.0),
+        ..Rules::default()
+    });
+    let target = sim.spawn_unit(unit(HOSTILE, kind::GROUND_VEHICLE, p(30.0, 0.0, 0.0), 0.0));
+    let seeker = sim.spawn_pursuer(
+        unit(FRIENDLY, kind::FIXED_WING_DRONE, p(0.0, 0.0, 0.0), 0.0),
+        Pursuer {
+            target,
+            speed: 50.0,
+            max_turn_rate: 3.0,
+            lead: 0.0,
+            engagement_radius_m: 5.0,
+            outcome_class: 0,
+        },
+    );
+    let bystander = sim.spawn_unit(unit(HOSTILE, kind::GROUND_VEHICLE, p(0.0, 90.0, 0.0), 0.0));
+    for (id, tag) in [
+        (target, 11),
+        (seeker, 12),
+        (bystander, 13),
+        (StableId(1), 14),
+    ] {
+        assert!(sim.set_tag(id, tag));
+    }
+    let mut ticks = 0;
+    while sim.engagement_events().is_empty() {
+        sim.step(1);
+        ticks += 1;
+        assert!(ticks < 100, "engages");
+    }
+    assert!(!sim.contains(target) && !sim.contains(seeker));
+    assert_eq!(sim.status().awaiting_cleanup, 2, "not despawned yet");
+    assert_eq!(
+        (sim.tag(target), sim.tag(seeker)),
+        (0, 0),
+        "cleared at once"
+    );
+    assert!(!sim.set_tag(target, 1), "a removed unit takes no tag");
+    assert_eq!((sim.tag(bystander), sim.tag(StableId(1))), (13, 14));
+    let bytes = sim.save().to_vec();
+    let mut tail = 2u32.to_le_bytes().to_vec();
+    for v in [1u64, 14, bystander.0, 13] {
+        tail.extend_from_slice(&v.to_le_bytes());
+    }
+    assert!(bytes.ends_with(&tail), "only live units' tags are saved");
+    assert!(Sim::restore(&bytes).unwrap().save() == &bytes[..]);
 }

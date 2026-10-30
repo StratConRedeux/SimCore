@@ -140,15 +140,29 @@ impl CommandQueue {
     }
 }
 
-/// Checks a command against the recipient's current state.
+/// Checks a command against the recipient's current state: the affiliation gate (only friendly
+/// units take commands), then [`validate_order`].
 pub(crate) fn validate(world: &World, unit: StableId, order: &Order) -> Result<(), CommandError> {
-    let index = world.resource::<IdIndex>();
-    let e = index.get(unit).ok_or(CommandError::UnknownUnit)?;
-    let u = world.entity(e);
-    if u.get::<Affiliation>().map(|a| a.0) != Some(affiliation::FRIENDLY) {
+    let e = world
+        .resource::<IdIndex>()
+        .get(unit)
+        .ok_or(CommandError::UnknownUnit)?;
+    if world.entity(e).get::<Affiliation>().map(|a| a.0) != Some(affiliation::FRIENDLY) {
         return Err(CommandError::NotFriendly);
     }
-    let pursuer = u.contains::<Pursuer>();
+    validate_order(world, unit, order)
+}
+
+/// Checks an order's type and values against a live unit of any affiliation: move and halt for
+/// non-pursuers, retarget for pursuers (at another existing unit), emissions for any unit.
+pub(crate) fn validate_order(
+    world: &World,
+    unit: StableId,
+    order: &Order,
+) -> Result<(), CommandError> {
+    let index = world.resource::<IdIndex>();
+    let e = index.get(unit).ok_or(CommandError::UnknownUnit)?;
+    let pursuer = world.entity(e).contains::<Pursuer>();
     match *order {
         Order::Move {
             destination: d,
@@ -177,8 +191,9 @@ pub(crate) fn validate(world: &World, unit: StableId, order: &Order) -> Result<(
     Ok(())
 }
 
-/// Applies one delivered command. Returns `false` if it had to be dropped.
-fn apply(world: &mut World, unit: StableId, order: Order) -> bool {
+/// Applies one delivered command, or a direct order ([`crate::Sim::order`]). Returns `false`
+/// if it had to be dropped.
+pub(crate) fn apply(world: &mut World, unit: StableId, order: Order) -> bool {
     let index = world.resource::<IdIndex>();
     let Some(e) = index.get(unit) else {
         return false;

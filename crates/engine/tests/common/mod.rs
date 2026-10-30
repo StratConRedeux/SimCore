@@ -3,7 +3,8 @@
 //! emitters, sensors (shared and own parameters), pursuers on both sides with several outcome
 //! classes whose chances are strictly between 0 and 1 (so every engagement draws from the
 //! RNG), standing orders (one with a duty-cycled launch unit), link delay with jamming, terrain
-//! and a script of moves, halts, retargets and emission changes. All numbers are fixtures.
+//! and a script of moves, halts, retargets and emission changes, as commands and as direct
+//! orders to any side, plus host tags. All numbers are fixtures.
 
 #![allow(dead_code)]
 
@@ -243,31 +244,52 @@ pub fn rich_world(seed: u64) -> Sim {
     sim
 }
 
-/// Issues a deterministic batch of commands (rejections are fine) and, now and then, a new
-/// unit or a cancelled standing order.
+/// A random order to a random unit of `ids`.
+fn random_order(rng: &mut Pcg32, ids: &[u64]) -> (StableId, Order) {
+    let id = StableId(ids[rng.below(ids.len() as u32) as usize]);
+    let order = match rng.below(4) {
+        0 => Order::Move {
+            destination: p(
+                rng.range_f64(-8000.0, 8000.0),
+                rng.range_f64(-8000.0, 8000.0),
+                0.0,
+            ),
+            speed_mps: rng.range_f64(5.0, 40.0),
+        },
+        1 => Order::Halt,
+        2 => Order::Retarget {
+            target: StableId(ids[rng.below(ids.len() as u32) as usize]),
+        },
+        _ => Order::Emissions {
+            radiate: rng.below(2) == 0,
+        },
+    };
+    (id, order)
+}
+
+/// Issues a deterministic batch of commands and direct orders to any side (rejections are
+/// fine), sets and clears host tags (pursuers' included, so removals clear some) and, now and
+/// then, spawns a new unit.
 pub fn script(sim: &mut Sim, rng: &mut Pcg32) {
     let mut ids: Vec<u64> = sim.frame().iter().map(|u| u.id).collect();
     ids.sort_unstable();
     for _ in 0..25 {
-        let id = StableId(ids[rng.below(ids.len() as u32) as usize]);
-        let order = match rng.below(4) {
-            0 => Order::Move {
-                destination: p(
-                    rng.range_f64(-8000.0, 8000.0),
-                    rng.range_f64(-8000.0, 8000.0),
-                    0.0,
-                ),
-                speed_mps: rng.range_f64(5.0, 40.0),
-            },
-            1 => Order::Halt,
-            2 => Order::Retarget {
-                target: StableId(ids[rng.below(ids.len() as u32) as usize]),
-            },
-            _ => Order::Emissions {
-                radiate: rng.below(2) == 0,
-            },
-        };
+        let (id, order) = random_order(rng, &ids);
         let _ = sim.command(id, order);
+    }
+    for _ in 0..10 {
+        let (id, order) = random_order(rng, &ids);
+        let _ = sim.order(id, order);
+    }
+    for _ in 0..8 {
+        let id = StableId(ids[rng.below(ids.len() as u32) as usize]);
+        let tag = match rng.below(4) {
+            0 => 0,
+            1 => u64::MAX,
+            _ => (u64::from(rng.next_u32()) << 20) | 1,
+        };
+        assert!(sim.set_tag(id, tag), "ids come from the frame");
+        assert_eq!(sim.tag(id), tag);
     }
     if rng.below(4) == 0 {
         let a = rng.range_f64(0.0, core::f64::consts::TAU);

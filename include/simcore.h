@@ -1,4 +1,4 @@
-/* SimCore C API, header revision 1.6 (ABI version 1). Must match crates/abi/src/lib.rs byte for byte. */
+/* SimCore C API, header revision 1.7 (ABI version 1). Must match crates/abi/src/lib.rs byte for byte. */
 #ifndef SIMCORE_H
 #define SIMCORE_H
 
@@ -112,7 +112,8 @@ static const uint16_t SC_COMMAND_RETARGET = 3;
 /* radiate 1: follow the duty cycle (or emit); 0: stay silent. */
 static const uint16_t SC_COMMAND_EMISSIONS = 4;
 
-/* One command to a friendly unit, applied after the link delay. Positions are f32 metres
+/* One command to a friendly unit, applied after the link delay (or, through sc_world_order,
+   at once to a unit of any affiliation). Positions are f32 metres
    relative to the command node when the command is issued (the frame's coordinates). Fields
    a type does not use are ignored; reserved fields must be zero. 40 bytes. */
 typedef struct ScCommand {
@@ -384,6 +385,22 @@ ScLaunches sc_world_launches(ScWorld *world);
    sc_world_standing_orders or sc_world_destroy on the same world. After a restore it lists the
    same orders as before the save. */
 ScStandingOrders sc_world_standing_orders(ScWorld *world);
+
+/* Revision 1.7: direct orders and host tags. For hosts that drive another side or scripted
+   units. */
+
+/* Applies `command` at once (before the next step) to any live unit of any affiliation. Same
+   type and value checks as sc_world_command: MOVE/HALT for non-pursuers, RETARGET for pursuers
+   (target must exist and differ), EMISSIONS for any unit. No link delay or jamming; not queued;
+   not counted in pending_commands or dropped_commands. A duty-cycled emitter follows an
+   EMISSIONS order from the next tick. Returns false on rejection. */
+bool sc_world_order(ScWorld *world, const ScCommand *command);
+
+/* Host data on a unit; the engine never reads it. 0 when unset. Saved with the world; cleared
+   when the unit is removed (same tick), so a save never holds a removed unit's tag. Setting 0
+   clears it. */
+bool sc_world_set_tag(ScWorld *world, uint64_t unit_id, uint64_t tag); /* false: unknown/removed */
+uint64_t sc_world_tag(const ScWorld *world, uint64_t unit_id);         /* 0: unset/unknown/removed */
 
 #if defined(__clang__)
 #pragma clang assume_nonnull end

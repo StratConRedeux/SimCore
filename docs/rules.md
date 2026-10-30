@@ -300,6 +300,20 @@ previews the delay; the status reports the delay at the command node itself.
 The jammer check scans the units once per call: commands and link-delay previews are per player
 action, not per tick.
 
+**Direct orders** (`Sim::order(unit, order)`, `sc_world_order`, revision 1.7) are for hosts that
+drive another side or scripted units. They take the same orders, with the same type and value
+checks, but go to a live unit of **any** affiliation and apply at once, before the next tick:
+no link delay or jamming, no queue, no command id, and neither the pending nor the dropped
+count changes. A move starts on the next tick; a duty-cycled emitter follows an emissions order
+from the next tick (one without a cycle turns on or off at once). A move started this way is
+saved like any other.
+
+**Host tags** (`Sim::set_tag` / `Sim::tag`, `sc_world_set_tag` / `sc_world_tag`, revision 1.7)
+are one `u64` per live unit that the host can use for its own data; the engine never reads
+them. Unset is 0, and setting 0 clears a tag. A unit's tag is cleared on the tick an engagement
+removes it, so a save never holds a removed unit's tag; an unknown or removed unit reads 0 and
+refuses a new tag.
+
 ## Standing orders
 
 A standing order is a rule the command node carries out by itself, at the end of every tick,
@@ -337,7 +351,7 @@ used every id; it is then not charged, neither stock nor cooldown.
 `Sim::standing_order(id)` gives `StandingOrderStatus { remaining, ready_tick }`.
 `Sim::standing_order_launches()` returns the `LaunchEvent { tick, order, pursuer, target }`s of
 the most recent `step` call, in order; the launched unit's engagement later names it as the
-pursuer. Standing orders are saved with the world (snapshot format 2).
+pursuer. Standing orders are saved with the world (snapshot format 2 on).
 
 Over the C API (revision 1.5), `sc_world_add_standing_order` takes an `ScStandingOrder`: the zone
 centre in metres relative to the command node at the call (then fixed in the world), and the
@@ -371,10 +385,12 @@ frame.
 ## Save and restore
 
 `Sim::save()` (`sc_world_save`) writes the whole world: clock, ids, the engagement PRNG, rules,
-link rules, terrain, every unit's components, moves in progress, queued commands and standing
-orders. The format
+link rules, terrain, every unit's components, moves in progress, queued commands, standing
+orders and host tags. The format
 is versioned, little-endian and checksummed (FNV-1a 64); it is not meant to be read by anything
-but `Sim::restore`. Format 2 added standing orders; a format-1 snapshot restores with none. Units are written in id order, so the bytes are canonical: saving a restored
+but `Sim::restore`. Format 2 added standing orders and format 3 host tags (a count, then `(id, tag)` per nonzero tag
+in ascending id order); an older snapshot restores without them (no standing orders, every tag
+0). Units are written in id order, so the bytes are canonical: saving a restored
 world gives the same bytes.
 
 `Sim::restore(bytes)` (`sc_world_restore`) gives a world that continues exactly as the saved one
@@ -382,7 +398,8 @@ would have: same frames (by id), events, rolls and status, tested over hundreds 
 commands on both. It rejects other formats, damaged bytes (any single-bit error is caught by the
 checksum) and impossible worlds (duplicate or out-of-range ids, no command node, invalid
 terrain, ticks or command ids at or above `2^62`, moves and queued commands that could never
-have been accepted, deliveries more than `u32::MAX` ticks away, standing orders that could never
+have been accepted (a move may be any side's, since a direct order can start it; a queued
+command must be a friendly unit's), tags on unknown units, of 0, repeated or out of order, deliveries more than `u32::MAX` ticks away, standing orders that could never
 have been added or that report more stock or cooldown than they could have), and never panics:
 tested on every truncation and on 20,000 randomly tampered payloads
 with the checksum recomputed. Ids are limited to below `2^24`, which bounds what a snapshot can

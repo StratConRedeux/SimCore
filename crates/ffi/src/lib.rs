@@ -317,6 +317,57 @@ pub unsafe extern "C" fn sc_world_command(world: *mut ScWorld, command: *const S
     })
 }
 
+/// `bool sc_world_order(ScWorld *world, const ScCommand *command);` Applies the command at
+/// once to a live unit of any affiliation (revision 1.7). `false` if it is rejected (the type
+/// and value checks of `sc_world_command`), either handle is NULL, or the call fails.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread; `command` is
+/// NULL or points to a readable `ScCommand`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_order(world: *mut ScWorld, command: *const ScCommand) -> bool {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return false;
+    };
+    // SAFETY: NULL or a readable ScCommand (caller contract). Copied out at once.
+    let Some(c) = (unsafe { command.as_ref() }).copied() else {
+        return false;
+    };
+    guard(false, || {
+        order(&w.sim, &c).is_some_and(|o| w.sim.order(StableId(c.unit_id), o).is_ok())
+    })
+}
+
+/// `bool sc_world_set_tag(ScWorld *world, uint64_t unit_id, uint64_t tag);` Sets the host's
+/// tag on a live unit; 0 clears it (revision 1.7). `false` for an unknown or removed unit, a
+/// NULL handle, or a failure.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not used concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_set_tag(world: *mut ScWorld, unit_id: u64, tag: u64) -> bool {
+    // SAFETY: NULL or a live, exclusively-used handle (caller contract).
+    let Some(w) = (unsafe { world.as_mut() }) else {
+        return false;
+    };
+    guard(false, || w.sim.set_tag(StableId(unit_id), tag))
+}
+
+/// `uint64_t sc_world_tag(const ScWorld *world, uint64_t unit_id);` The host's tag on a unit:
+/// 0 if unset, the unit is unknown or removed, the handle is NULL, or the call fails.
+///
+/// # Safety
+/// `world` is NULL or a live handle, not mutated concurrently from another thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sc_world_tag(world: *const ScWorld, unit_id: u64) -> u64 {
+    // SAFETY: NULL or a live handle that nobody mutates during this call (caller contract).
+    let Some(w) = (unsafe { world.as_ref() }) else {
+        return 0;
+    };
+    guard(0, || w.sim.tag(StableId(unit_id)))
+}
+
 const fn empty_bytes() -> ScBytes {
     ScBytes {
         data: std::ptr::null(),
@@ -888,6 +939,9 @@ const _: () = {
     let _: unsafe extern "C" fn(*mut ScWorld, u64) -> u32 = sc_world_standing_order_stock;
     let _: unsafe extern "C" fn(*mut ScWorld) -> ScLaunches = sc_world_launches;
     let _: unsafe extern "C" fn(*mut ScWorld) -> ScStandingOrders = sc_world_standing_orders;
+    let _: unsafe extern "C" fn(*mut ScWorld, *const ScCommand) -> bool = sc_world_order;
+    let _: unsafe extern "C" fn(*mut ScWorld, u64, u64) -> bool = sc_world_set_tag;
+    let _: unsafe extern "C" fn(*const ScWorld, u64) -> u64 = sc_world_tag;
 };
 
 #[cfg(test)]

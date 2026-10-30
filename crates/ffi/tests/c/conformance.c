@@ -113,6 +113,9 @@ static uint32_t (*const p_standing_order_stock)(ScWorld *, uint64_t) =
     sc_world_standing_order_stock;
 static ScLaunches (*const p_launches)(ScWorld *) = sc_world_launches;
 static ScStandingOrders (*const p_standing_orders)(ScWorld *) = sc_world_standing_orders;
+static bool (*const p_order)(ScWorld *, const ScCommand *) = sc_world_order;
+static bool (*const p_set_tag)(ScWorld *, uint64_t, uint64_t) = sc_world_set_tag;
+static uint64_t (*const p_tag)(const ScWorld *, uint64_t) = sc_world_tag;
 
 static int failures = 0;
 #define CHECK(cond)                                                                \
@@ -478,6 +481,64 @@ int main(void) {
     CHECK(p_standing_orders(s).count == 0 && p_standing_orders(s).orders == NULL);
     CHECK(p_standing_orders(NULL).count == 0 && p_standing_orders(NULL).orders == NULL);
     p_destroy(s);
+
+    /* Revision 1.7: direct orders to a hostile unit, and host tags. */
+    ScCommand halt = {.unit_id = 1, .type = SC_COMMAND_HALT};
+    CHECK(!p_order(NULL, &halt));
+    CHECK(!p_set_tag(NULL, 1, 1));
+    CHECK(p_tag(NULL, 1) == 0);
+    ScWorld *dw = p_create(11);
+    CHECK(!p_order(dw, NULL));
+    CHECK(p_order(dw, &halt));
+    ScUnitSpec hs = {.x = 100.0, .erp_w = 5.0f, .kind = SC_KIND_GROUND_VEHICLE,
+                     .affiliation = SC_AFFILIATION_HOSTILE, .options = SC_SPAWN_CYCLE,
+                     .cycle_on_ticks = 1000, .cycle_off_ticks = 1};
+    uint64_t hid = p_spawn(dw, &hs);
+    CHECK(hid == 2);
+    ScCommand hmv = {.unit_id = hid, .x = 115.0f, .speed_mps = 15.0f, .type = SC_COMMAND_MOVE};
+    CHECK(p_command(dw, &hmv) == 0); /* commands are for friendly units */
+    CHECK(p_order(dw, &hmv));
+    ScCommand hbad = hmv;
+    hbad._reserved1 = 1;
+    CHECK(!p_order(dw, &hbad));
+    hbad = hmv;
+    hbad.speed_mps = 0.0f;
+    CHECK(!p_order(dw, &hbad));
+    hbad = hmv;
+    hbad.unit_id = 999;
+    CHECK(!p_order(dw, &hbad));
+    ScCommand hret = {.unit_id = hid, .target_id = 1, .type = SC_COMMAND_RETARGET};
+    CHECK(!p_order(dw, &hret)); /* not a pursuer */
+    ScCommand silence = {.unit_id = hid, .type = SC_COMMAND_EMISSIONS, .radiate = 0};
+    CHECK(p_order(dw, &silence));
+    ScStatus hst = p_status(dw);
+    CHECK(hst.pending_commands == 0 && hst.dropped_commands == 0);
+    CHECK(p_tag(dw, hid) == 0);
+    CHECK(p_set_tag(dw, hid, UINT64_MAX));
+    CHECK(p_tag(dw, hid) == UINT64_MAX);
+    CHECK(!p_set_tag(dw, 999, 1));
+    CHECK(p_tag(dw, 999) == 0);
+    CHECK(p_set_tag(dw, 1, 7));
+    CHECK(p_set_tag(dw, 1, 0));
+    CHECK(p_tag(dw, 1) == 0);
+    p_step(dw, 20);
+    ScFrame hf = p_frame(dw);
+    int found = 0;
+    for (uint32_t i = 0; i < hf.count; i++) {
+        if (hf.units[i].id == hid) {
+            found = 1;
+            CHECK(hf.units[i].x > 114.99f && hf.units[i].x < 115.01f);
+            CHECK(hf.units[i].vx == 0.0f);
+            CHECK((hf.units[i].flags & SC_FLAG_EMITTING) == 0);
+        }
+    }
+    CHECK(found);
+    ScBytes hb = p_save(dw);
+    ScWorld *dr = p_restore(hb.data, hb.len);
+    CHECK(dr != NULL);
+    CHECK(p_tag(dr, hid) == UINT64_MAX && p_tag(dr, 1) == 0);
+    p_destroy(dr);
+    p_destroy(dw);
 
     if (failures) {
         fprintf(stderr, "conformance: %d failure(s)\n", failures);

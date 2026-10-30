@@ -904,6 +904,142 @@ fn standing_orders_are_listed_relative_to_the_command_node() {
     }
 }
 
+#[test]
+fn direct_orders_and_tags_over_the_c_api() {
+    use simcore_abi::affiliation::{FRIENDLY, HOSTILE};
+    // SAFETY: NULL is accepted for every handle and pointer; `w` and `r` are live handles used
+    // only on this thread, each destroyed once; `saved` is copied before the next call on `w`.
+    unsafe {
+        let halt = ScCommand {
+            unit_id: 1,
+            type_: command::HALT,
+            ..ScCommand::default()
+        };
+        assert!(!sc_world_order(std::ptr::null_mut(), &halt));
+        assert!(!sc_world_set_tag(std::ptr::null_mut(), 1, 1));
+        assert_eq!(sc_world_tag(std::ptr::null(), 1), 0);
+
+        let w = sc_world_create(4);
+        assert!(!sc_world_order(w, std::ptr::null()));
+        let link = ScLinkRules {
+            base_delay_ticks: 25,
+            max_delay_ticks: 100,
+            ..ScLinkRules::default()
+        };
+        assert!(sc_world_set_link_rules(w, &link));
+        let mover = sc_world_spawn(w, &unit_at(0.0, 10.0, HOSTILE, kind::GROUND_VEHICLE));
+        let radar = sc_world_spawn(
+            w,
+            &ScUnitSpec {
+                options: spawn::CYCLE,
+                cycle_on_ticks: 4,
+                cycle_off_ticks: 1,
+                ..unit_at(200.0, 0.0, HOSTILE, kind::GROUND_RADAR)
+            },
+        );
+        let friend = sc_world_spawn(w, &unit_at(-40.0, 0.0, FRIENDLY, kind::GROUND_VEHICLE));
+        let seeker = sc_world_spawn(
+            w,
+            &ScUnitSpec {
+                options: spawn::PURSUER,
+                target_id: friend,
+                speed_mps: 1.0,
+                max_turn_rate_rad_s: 1.0,
+                ..unit_at(900.0, 0.0, HOSTILE, kind::FIXED_WING_DRONE)
+            },
+        );
+        assert!(mover != 0 && radar != 0 && friend != 0 && seeker != 0);
+        let mv = ScCommand {
+            unit_id: mover,
+            x: 30.0,
+            y: 10.0,
+            speed_mps: 15.0,
+            type_: command::MOVE,
+            ..ScCommand::default()
+        };
+        let emissions = |unit_id, radiate| ScCommand {
+            unit_id,
+            type_: command::EMISSIONS,
+            radiate,
+            ..ScCommand::default()
+        };
+        let retarget = |target_id| ScCommand {
+            unit_id: seeker,
+            target_id,
+            type_: command::RETARGET,
+            ..ScCommand::default()
+        };
+        assert_eq!(sc_world_command(w, &mv), 0, "commands stay friendly-only");
+        for bad in [
+            ScCommand { unit_id: 999, ..mv },
+            ScCommand {
+                _reserved0: 1,
+                ..mv
+            },
+            ScCommand {
+                speed_mps: f32::NAN,
+                ..mv
+            },
+            ScCommand { type_: 99, ..mv },
+            ScCommand {
+                unit_id: seeker,
+                ..mv
+            },
+            ScCommand {
+                unit_id: seeker,
+                ..halt
+            },
+            emissions(radar, 2),
+            retarget(seeker),
+            retarget(999),
+            ScCommand {
+                unit_id: mover,
+                ..retarget(friend)
+            },
+        ] {
+            assert!(!sc_world_order(w, &bad), "{bad:?}");
+        }
+        assert!(sc_world_order(w, &mv));
+        assert!(sc_world_order(w, &emissions(radar, 0)));
+        assert!(sc_world_order(w, &retarget(1)));
+        assert!(sc_world_order(w, &halt), "the command node too");
+        let s = sc_world_status(w);
+        assert_eq!((s.pending_commands, s.dropped_commands), (0, 0));
+
+        assert_eq!(sc_world_tag(w, mover), 0);
+        assert!(sc_world_set_tag(w, mover, u64::MAX));
+        assert!(sc_world_set_tag(w, seeker, 3));
+        assert!(!sc_world_set_tag(w, 999, 3));
+        assert_eq!(sc_world_tag(w, 999), 0);
+        assert!(sc_world_set_tag(w, seeker, 0));
+        assert_eq!(sc_world_tag(w, seeker), 0);
+
+        // 30 m at 15 m/s: there after 30 ticks, stopped on the next.
+        sc_world_step(w, 31);
+        let f = frame_of(w);
+        let unit = |id| f.iter().find(|u| u.id == id).unwrap();
+        assert!((unit(mover).x - 30.0).abs() < 1e-4 && unit(mover).vx == 0.0);
+        assert_eq!(unit(radar).flags & flags::EMITTING, 0);
+        assert!(unit(seeker).vx < 0.0, "heading for the command node");
+        assert_eq!(sc_world_command(w, &halt), 1, "orders took no command ids");
+
+        let saved = {
+            let b = sc_world_save(w);
+            std::slice::from_raw_parts(b.data, b.len as usize).to_vec()
+        };
+        let r = sc_world_restore(saved.as_ptr(), saved.len() as u64);
+        assert!(!r.is_null());
+        assert_eq!(sc_world_tag(r, mover), u64::MAX);
+        assert!(sc_world_order(r, &emissions(radar, 1)));
+        assert!(sc_world_order(w, &emissions(radar, 1)));
+        sc_world_step(w, 7);
+        sc_world_step(r, 7);
+        assert_eq!(frame_of(w), frame_of(r));
+        sc_world_destroy(r);
+        sc_world_destroy(w);
+    }
+}
+
 #[cfg(panic = "unwind")]
 #[test]
 fn guard_catches_panics() {

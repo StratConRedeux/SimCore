@@ -377,3 +377,124 @@ fn unrepresentably_far_moves_end_instead_of_stalling_or_going_nan() {
     let pb = sim.position(b).unwrap();
     assert!(pb.x == -1e308 && pb.y == 0.0, "stopped, not NaN: {pb:?}");
 }
+
+#[test]
+fn direct_orders_reach_any_side_at_once() {
+    let mut sim = Sim::new(1);
+    sim.set_rules(Rules {
+        outcomes: OutcomeTable::new(1.0),
+        ..Rules::default()
+    });
+    // A long link delay and a hostile jammer next to everything: direct orders ignore both.
+    sim.set_link_rules(LinkRules {
+        base_delay_ticks: 500,
+        jam_radius_m: 10_000.0,
+        jam_delay_ticks: 500,
+        max_delay_ticks: 2000,
+        ..LinkRules::default()
+    });
+    sim.spawn_unit(unit(HOSTILE, kind::JAMMER, p(0.0, -100.0, 0.0), 100.0));
+    let mover = sim.spawn_unit(unit(HOSTILE, kind::GROUND_VEHICLE, p(0.0, 50.0, 0.0), 0.0));
+    let drifter = sim.spawn_unit(UnitSpec {
+        velocity: Velocity {
+            x: 3.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        ..unit(HOSTILE, kind::GROUND_VEHICLE, p(0.0, -50.0, 0.0), 0.0)
+    });
+    let radar = sim.spawn_unit(UnitSpec {
+        cycle: Some(EmitterCycle {
+            on_ticks: 10,
+            off_ticks: 10,
+            phase: 0,
+        }),
+        ..unit(HOSTILE, kind::GROUND_RADAR, p(500.0, 0.0, 0.0), 100.0)
+    });
+    let neutral = sim.spawn_unit(unit(0, kind::GROUND_VEHICLE, p(900.0, 0.0, 0.0), 0.0));
+    let a = sim.spawn_unit(unit(
+        FRIENDLY,
+        kind::GROUND_VEHICLE,
+        p(2000.0, 0.0, 0.0),
+        0.0,
+    ));
+    let b = sim.spawn_unit(unit(
+        FRIENDLY,
+        kind::GROUND_VEHICLE,
+        p(-300.0, 0.0, 0.0),
+        0.0,
+    ));
+    let seeker = sim.spawn_pursuer(
+        unit(HOSTILE, kind::FIXED_WING_DRONE, p(-200.0, 0.0, 0.0), 0.0),
+        pursuer(a),
+    );
+
+    use CommandError::*;
+    // Same type and value checks as commands, for every side.
+    assert_eq!(sim.order(StableId(99), Order::Halt), Err(UnknownUnit));
+    assert_eq!(sim.order(seeker, mv(1.0, 1.0, 1.0)), Err(WrongUnitType));
+    assert_eq!(sim.order(seeker, Order::Halt), Err(WrongUnitType));
+    let retarget = |target| Order::Retarget { target };
+    assert_eq!(sim.order(mover, retarget(a)), Err(WrongUnitType));
+    assert_eq!(sim.order(seeker, retarget(seeker)), Err(InvalidOrder));
+    assert_eq!(sim.order(seeker, retarget(StableId(99))), Err(InvalidOrder));
+    for bad in [
+        mv(f64::NAN, 0.0, 1.0),
+        mv(1.0, 0.0, 0.0),
+        mv(1.0, 0.0, -1.0),
+    ] {
+        assert_eq!(sim.order(mover, bad), Err(InvalidOrder), "{bad:?}");
+    }
+    // Commands to them are still refused.
+    assert_eq!(sim.command(mover, Order::Halt), Err(NotFriendly));
+
+    assert_eq!(sim.order(mover, mv(100.0, 50.0, 15.0)), Ok(()));
+    assert_eq!(sim.order(drifter, Order::Halt), Ok(()));
+    assert_eq!(
+        sim.order(radar, Order::Emissions { radiate: false }),
+        Ok(())
+    );
+    assert_eq!(sim.order(neutral, mv(900.0, 30.0, 15.0)), Ok(()));
+    assert_eq!(sim.order(seeker, retarget(b)), Ok(()));
+    assert_eq!(sim.order(a, Order::Emissions { radiate: false }), Ok(()));
+    let s = sim.status();
+    assert_eq!(
+        (s.pending_commands, s.dropped_commands),
+        (0, 0),
+        "not queued"
+    );
+
+    // Halt stops the drifter at once; the move starts on the next tick.
+    assert_eq!(
+        sim.world()
+            .get::<Velocity>(sim.entity(drifter).unwrap())
+            .copied(),
+        Some(Velocity::default())
+    );
+    // Tick 0 is "on" for the radar's cycle, but it is silent from the next tick.
+    assert!(emitting(&mut sim, radar));
+    sim.step(1);
+    assert!(!emitting(&mut sim, radar));
+    let mut engaged = None;
+    for _ in 0..99 {
+        sim.step(1);
+        assert!(!emitting(&mut sim, radar), "silent through its cycle");
+        engaged = engaged.or(sim.engagement_events().first().copied());
+    }
+    // 100 m at 15 m/s: 100 ticks, the last one partial.
+    assert!((sim.position(mover).unwrap().x - 100.0).abs() < 1e-9);
+    assert_eq!(sim.position(drifter).unwrap(), p(0.0, -50.0, 0.0));
+    assert!((sim.position(neutral).unwrap().y - 30.0).abs() < 1e-9);
+    let e = engaged.expect("the retargeted pursuer engaged");
+    assert_eq!((e.pursuer, e.target), (seeker, b));
+    assert!(sim.contains(a) && !sim.contains(b));
+
+    // Back on the duty cycle; a removed unit takes no orders.
+    assert_eq!(sim.order(radar, Order::Emissions { radiate: true }), Ok(()));
+    assert_eq!(sim.order(b, Order::Halt), Err(UnknownUnit));
+    let t = sim.tick();
+    sim.step(1);
+    assert_eq!(emitting(&mut sim, radar), t % 20 < 10);
+    // Commands carry on numbering from 1: orders took no command ids.
+    assert_eq!(sim.command(a, Order::Halt), Ok(1));
+}
